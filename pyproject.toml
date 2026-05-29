@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jeff"
+version = "0.1.0"
+description = "Personal AI assistant — first inhabitant of the Ensemble multi-service platform"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "boxsie" }]
+dependencies = [
+    "ensemble-client>=0.2.0",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
+    "psycopg-pool>=3.2",
+    "pgvector>=0.3",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-asyncio>=0.23",
+    "testcontainers[postgres]>=4.0",
+    "respx>=0.21",
+]
+
+[project.scripts]
+jeff = "jeff.__main__:run"
+
+[project.urls]
+Homepage = "https://github.com/boxsie/jeff"
+Repository = "https://github.com/boxsie/jeff"
+
+[tool.hatch.build]
+ignore-vcs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["jeff"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "jeff",
+    "README.md",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100

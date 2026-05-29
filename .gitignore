@@ -1,0 +1,27 @@
+## Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+*.log
+
+## Editors / IDEs
+.vs/
+.vscode/
+.idea/
+*.user
+
+## OS cruft
+.DS_Store
+Thumbs.db
+
+## Host-specific Claude Code MCP config (paths are absolute to this machine)
+.mcp.json

@@ -1,0 +1,246 @@
+"""Postgres + pgvector semantic memory.
+
+Schema is created idempotently on first connect, so the bot can boot against
+an empty database without a separate migration step. One async connection
+pool per process; embeddings come from Ollama via the provided client.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+
+import numpy as np
+from pgvector.psycopg import register_vector_async
+from psycopg import sql
+from psycopg_pool import AsyncConnectionPool
+
+from .screen import strip_chat_template_tokens
+
+
+class _Embedder(Protocol):
+    async def embed(self, text: str, *, model: str) -> list[float]: ...
+
+
+# Hard ceiling on stored content bytes. The intended input cap is much lower
+# (8 KiB via JEFF_MAX_MESSAGE_BYTES), enforced in main._drain_events; this is
+# defense-in-depth so a future code path that bypasses screen_text cannot
+# silently insert a 1 GB row. Sized at 8x the default input cap so legitimate
+# operator bumps of JEFF_MAX_MESSAGE_BYTES don't immediately hit this.
+MAX_CONTENT_BYTES = 65536
+
+
+@dataclass(frozen=True)
+class Message:
+    id: int
+    peer: str
+    role: str
+    content: str
+    ts: datetime
+
+
+# W3 #20123205: the only env-derived value in DDL is the embedding
+# dimension. config.Config bounds it to [1, 8192] at load time, but the
+# defense-in-depth shape here is what stops a future change to that bound
+# (or a direct caller that bypasses Config) from injecting through .format.
+# Each statement is composed with psycopg.sql primitives + executed
+# separately rather than a single multi-statement .format string.
+_DDL_EXTENSION = sql.SQL("CREATE EXTENSION IF NOT EXISTS vector")
+
+_DDL_TABLE = sql.SQL(
+    "CREATE TABLE IF NOT EXISTS messages ("
+    "id BIGSERIAL PRIMARY KEY, "
+    "peer TEXT NOT NULL, "
+    "role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')), "
+    "content TEXT NOT NULL, "
+    "embedding vector({dim}) NOT NULL, "
+    "ts TIMESTAMPTZ NOT NULL DEFAULT now())"
+)
+
+_DDL_IDX_PEER_TS = sql.SQL(
+    "CREATE INDEX IF NOT EXISTS idx_messages_peer_ts ON messages(peer, ts DESC)"
+)
+
+_DDL_IDX_EMBEDDING = sql.SQL(
+    "CREATE INDEX IF NOT EXISTS idx_messages_embedding "
+    "ON messages USING hnsw (embedding vector_cosine_ops)"
+)
+
+
+class Memory:
+    """Async memory store backed by Postgres + pgvector."""
+
+    def __init__(
+        self,
+        pool: AsyncConnectionPool,
+        embedder: _Embedder,
+        *,
+        embed_model: str,
+        embed_dim: int,
+    ):
+        self._pool = pool
+        self._embedder = embedder
+        self._embed_model = embed_model
+        self._embed_dim = embed_dim
+
+    @classmethod
+    async def create(
+        cls,
+        pool: AsyncConnectionPool,
+        embedder: _Embedder,
+        *,
+        embed_model: str,
+        embed_dim: int,
+    ) -> "Memory":
+        m = cls(pool, embedder, embed_model=embed_model, embed_dim=embed_dim)
+        await m._init_schema()
+        return m
+
+    async def _init_schema(self) -> None:
+        # Composes the per-statement DDL pieces with psycopg.sql so the
+        # only env-derived value (the embedding dimension) lands inside a
+        # Literal placeholder rather than a Python f-string. The dim is
+        # already bounded at config load (W3 #20123205) so this is
+        # defense in depth.
+        if not (1 <= self._embed_dim <= 8192):
+            raise ValueError(
+                f"embed_dim out of range: {self._embed_dim} (allowed 1..8192)"
+            )
+        table_ddl = _DDL_TABLE.format(dim=sql.Literal(self._embed_dim))
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(_DDL_EXTENSION)
+                await cur.execute(table_ddl)
+                await cur.execute(_DDL_IDX_PEER_TS)
+                await cur.execute(_DDL_IDX_EMBEDDING)
+            await conn.commit()
+            await register_vector_async(conn)
+
+    async def _connection(self):
+        # psycopg_pool reuses connections, so register the vector adapter on
+        # each checkout. Cheap, idempotent.
+        return self._pool.connection()
+
+    async def remember(self, peer: str, role: str, content: str) -> int:
+        # W3 #dc9acd3c: an allowlisted peer can otherwise plant a row
+        # containing gemma chat-template tokens (<start_of_turn>model...)
+        # that would be rendered as a forged assistant turn the next time
+        # the row is recalled and re-fed to the LLM. Strip on insert so
+        # memory never carries them; recall does the same strip as belt
+        # and braces for rows that predate this guard.
+        content = strip_chat_template_tokens(content)
+
+        # Belt-and-braces: main._drain_events is supposed to have already
+        # rejected oversize input via screen_text. If something slips past
+        # (test seam, future caller), refuse here rather than embedding +
+        # inserting a multi-MB row.
+        size = len(content.encode("utf-8"))
+        if size > MAX_CONTENT_BYTES:
+            raise ValueError(
+                f"content too large: {size} bytes (limit {MAX_CONTENT_BYTES})"
+            )
+        emb = await self._embedder.embed(content, model=self._embed_model)
+        if len(emb) != self._embed_dim:
+            raise ValueError(
+                f"embedding dim mismatch: got {len(emb)}, configured {self._embed_dim} "
+                f"(check OLLAMA_EMBED_DIM matches the {self._embed_model} model)"
+            )
+        vec = np.asarray(emb, dtype=np.float32)
+        async with self._pool.connection() as conn:
+            await register_vector_async(conn)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO messages (peer, role, content, embedding) "
+                    "VALUES (%s, %s, %s, %s) RETURNING id",
+                    (peer, role, content, vec),
+                )
+                row = await cur.fetchone()
+            await conn.commit()
+            return int(row[0])
+
+    async def recall(
+        self,
+        peer: str,
+        query: str,
+        k: int = 5,
+        *,
+        distance_max: float = 0.4,
+    ) -> list[Message]:
+        # W3 #dc9acd3c: pgvector "<=>" returns cosine *distance* (0 =
+        # identical, 1 = orthogonal). Two reasons to floor it:
+        #   1. Near-zero distance means a stored row that looks just like
+        #      the query — quite possibly the peer's own crafted text
+        #      (echo attack).
+        #   2. Far distances (>0.4) mean the row isn't actually relevant;
+        #      feeding it to the LLM under "you have access to memory of
+        #      prior conversations" steers replies toward irrelevant
+        #      context. 0.4 is empirically tight for nomic-embed-text;
+        #      callers can pass a wider distance_max for noisier embeds.
+        emb = await self._embedder.embed(query, model=self._embed_model)
+        vec = np.asarray(emb, dtype=np.float32)
+        async with self._pool.connection() as conn:
+            await register_vector_async(conn)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, peer, role, content, ts FROM messages "
+                    "WHERE peer = %s "
+                    "  AND (embedding <=> %s) <= %s "
+                    "ORDER BY embedding <=> %s "
+                    "LIMIT %s",
+                    (peer, vec, distance_max, vec, k),
+                )
+                rows = await cur.fetchall()
+        return [
+            Message(
+                id=r[0],
+                peer=r[1],
+                role=r[2],
+                content=strip_chat_template_tokens(r[3]),
+                ts=r[4],
+            )
+            for r in rows
+        ]
+
+    async def recent(self, peer: str, n: int = 10) -> list[Message]:
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, peer, role, content, ts FROM messages "
+                    "WHERE peer = %s "
+                    "ORDER BY ts DESC "
+                    "LIMIT %s",
+                    (peer, n),
+                )
+                rows = await cur.fetchall()
+        # Return chronological (oldest first) so callers can append to chat history directly.
+        rows = list(reversed(rows))
+        return [
+            Message(
+                id=r[0],
+                peer=r[1],
+                role=r[2],
+                content=strip_chat_template_tokens(r[3]),
+                ts=r[4],
+            )
+            for r in rows
+        ]
+
+    async def forget(self, peer: str) -> int:
+        """Flush all memory for a single peer. Returns the row count deleted.
+
+        Admin-only path for W3 #dc9acd3c: if an allowlisted peer has been
+        observed poisoning memory, the operator can clear that peer's slice
+        without nuking everyone else's history. Cross-peer leak is not a
+        concern today (recall is peer-keyed), but this gives the operator
+        an explicit recovery tool.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM messages WHERE peer = %s",
+                    (peer,),
+                )
+                deleted = cur.rowcount
+            await conn.commit()
+        return int(deleted)
