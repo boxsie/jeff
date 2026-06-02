@@ -11,6 +11,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from .config import Config
 from .dispatch import DispatchPolicy, TurnDispatcher
+from .llm import ChatProvider, make_chat_provider
 from .memory import Memory
 from .ollama import Ollama
 from .prompt import build_history
@@ -23,7 +24,7 @@ log = logging.getLogger("jeff")
 async def handle_turn(
     handle: ensemble.ServiceHandle,
     memory: Memory,
-    ollama: Ollama,
+    chat_provider: ChatProvider,
     cfg: Config,
     peer: str,
     text: str,
@@ -44,7 +45,7 @@ async def handle_turn(
             recent_turns=cfg.recent_turns,
             recall_k=cfg.recall_k,
         )
-        reply = await ollama.chat(history, model=cfg.chat_model)
+        reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
         await memory.remember(peer, "assistant", reply)
     except Exception as e:
@@ -93,14 +94,19 @@ async def run(cfg: Config) -> None:
             pass
 
     try:
+        # Embeddings always run on the local Ollama (nomic-embed-text is tiny
+        # and fits the GPU); chat goes to whatever provider cfg selects. When
+        # the chat provider is also ollama these are two clients to the same
+        # URL — cheap, and it keeps the embed path independent of chat config.
         async with Ollama(
             cfg.ollama_url,
             max_resp_bytes=cfg.ollama_max_resp_bytes,
             max_embed_dim=cfg.ollama_max_embed_dim,
-        ) as ollama:
+        ) as embed_client, make_chat_provider(cfg) as chat_provider:
+            log.info("chat provider=%s model=%s", cfg.llm_provider, cfg.chat_model)
             memory = await Memory.create(
                 pool,
-                ollama,
+                embed_client,
                 embed_model=cfg.embed_model,
                 embed_dim=cfg.embed_dim,
             )
@@ -125,7 +131,7 @@ async def run(cfg: Config) -> None:
                     )
 
                     async def _on_turn(peer: str, text: str) -> None:
-                        await handle_turn(handle, memory, ollama, cfg, peer, text)
+                        await handle_turn(handle, memory, chat_provider, cfg, peer, text)
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
 

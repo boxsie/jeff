@@ -10,10 +10,13 @@ attacker's text (embed). `_safe_excerpt` truncates + strips control chars
 before they reach OllamaError / container logs (log-injection defence).
 
 Response sizes are also bounded: a hostile or replaced local Ollama could
-ship a 10 GiB body and OOM-kill us. `_read_bounded` aborts streaming once
+ship a 10 GiB body and OOM-kill us. `read_bounded` aborts streaming once
 the byte budget is hit, and a Content-Length pre-check shortcuts the obvious
 case. Embedding length is capped separately before `float()` materialisation
 so a `{"embedding": [0]*10_000_000}` reply can't drive the daemon OOM.
+
+The log-injection + response-size helpers are shared with the other LLM
+providers — see `jeff/_http.py`.
 """
 
 from __future__ import annotations
@@ -23,62 +26,16 @@ from typing import Sequence
 
 import httpx
 
-
-# Maximum chars of a response body to surface in OllamaError. The body is
-# attacker-influenced; never include the full thing in an exception message.
-_EXCERPT_LIMIT = 256
+from ._http import ResponseTooLargeError, read_bounded
+from ._http import safe_excerpt as _safe_excerpt
 
 # Defaults — overridable via Ollama() ctor kwargs / env-driven Config.
 DEFAULT_MAX_RESP_BYTES = 8 * 1024 * 1024  # 8 MiB
 DEFAULT_MAX_EMBED_DIM = 8192
 
 
-def _safe_excerpt(s: str, limit: int = _EXCERPT_LIMIT) -> str:
-    """Sanitise an attacker-influenced string for inclusion in a log/exception.
-
-    Drops control chars (0x00–0x1F and 0x7F) except plain space, replaces
-    them with `?`, and truncates to `limit` chars with a `…(N more)` tail
-    so the size info survives but the bytes don't.
-    """
-    cleaned = "".join(
-        ch if (ch == " " or (ord(ch) >= 0x20 and ord(ch) != 0x7F)) else "?" for ch in s
-    )
-    if len(cleaned) <= limit:
-        return cleaned
-    return f"{cleaned[:limit]}…({len(cleaned) - limit} more)"
-
-
 class OllamaError(Exception):
     pass
-
-
-async def _read_bounded(resp: httpx.Response, max_bytes: int) -> bytes:
-    """Read a streaming response, refusing more than `max_bytes` of body.
-
-    Two layers: (1) if Content-Length is declared and exceeds the cap, fail
-    before reading a single byte. (2) Otherwise stream chunks and abort the
-    moment the running total crosses the cap. Both raise OllamaError —
-    callers don't need to special-case the source of the overflow.
-    """
-    cl = resp.headers.get("content-length")
-    if cl is not None:
-        try:
-            declared = int(cl)
-        except ValueError:
-            declared = None
-        if declared is not None and declared > max_bytes:
-            raise OllamaError(
-                f"response Content-Length {declared} exceeds max {max_bytes}"
-            )
-
-    total = 0
-    chunks: list[bytes] = []
-    async for chunk in resp.aiter_bytes():
-        total += len(chunk)
-        if total > max_bytes:
-            raise OllamaError(f"response exceeded {max_bytes} bytes during stream")
-        chunks.append(chunk)
-    return b"".join(chunks)
 
 
 class Ollama:
@@ -110,8 +67,8 @@ class Ollama:
         """
         async with self._client.stream("POST", path, json=payload) as resp:
             try:
-                body = await _read_bounded(resp, self._max_resp_bytes)
-            except OllamaError as e:
+                body = await read_bounded(resp, self._max_resp_bytes)
+            except ResponseTooLargeError as e:
                 raise OllamaError(f"{kind}: {e}") from None
             return resp.status_code, body
 

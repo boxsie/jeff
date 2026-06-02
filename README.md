@@ -61,9 +61,13 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_ALLOWLIST` | _empty_ | Comma-separated peer addresses allowed to chat. Empty = ignore everyone (safer than "anyone"). |
 | `ENSEMBLE_SOCKET` | `/run/ensemble/sock` | Path to the daemon's gRPC unix socket |
 | `ENSEMBLE_AUTH_SEED` | _none_ | Path to the admin-key seed file for gRPC auth (optional for local sockets without auth) |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint |
-| `OLLAMA_CHAT_MODEL` | `gemma3:12b-it-qat` | Chat completion model |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model |
+| `JEFF_LLM_PROVIDER` | `ollama` | Chat provider: `ollama` (local) or `grok` (xAI cloud). Unknown values fail at startup. |
+| `JEFF_CHAT_MODEL` | _provider default_ | Provider-agnostic chat model override. Wins over `OLLAMA_CHAT_MODEL`. Defaults: `gemma3:12b-it-qat` (ollama), `grok-4` (grok). |
+| `XAI_API_KEY` | _none_ | xAI API key. **Required** when `JEFF_LLM_PROVIDER=grok` (startup fails fast if missing). Never logged. |
+| `XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API base URL (OpenAI-compatible `/chat/completions`). |
+| `OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint (always used for embeddings, regardless of chat provider) |
+| `OLLAMA_CHAT_MODEL` | `gemma3:12b-it-qat` | Chat model under the `ollama` provider (legacy; `JEFF_CHAT_MODEL` overrides it) |
+| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model (embeddings stay local) |
 | `OLLAMA_EMBED_DIM` | `768` | Embedding vector dimensionality (must match the model) |
 | `MEMORY_RECALL_K` | `5` | How many semantically-similar past messages to retrieve per turn |
 | `MEMORY_RECENT_TURNS` | `10` | How many most-recent messages to include per turn |

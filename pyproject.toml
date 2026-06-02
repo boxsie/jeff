@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jeff"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personal AI assistant — first inhabitant of the Ensemble multi-service platform"
 readme = "README.md"
 requires-python = ">=3.12"

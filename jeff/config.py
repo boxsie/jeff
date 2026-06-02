@@ -19,6 +19,18 @@ class ConfigError(Exception):
 _EMBED_DIM_MIN = 1
 _EMBED_DIM_MAX = 8192
 
+# Chat providers Jeff knows how to build (see jeff/llm.py:make_chat_provider).
+# `ollama` is the back-compat default (local); `grok` is xAI's cloud API.
+_KNOWN_PROVIDERS = frozenset({"ollama", "grok"})
+
+# Provider-specific default chat models. Both are overridable: the
+# provider-agnostic JEFF_CHAT_MODEL wins everywhere; under ollama the legacy
+# OLLAMA_CHAT_MODEL is still honoured. The Grok default tracks an available
+# xAI model id (flagship is grok-4.3 as of 2026-06; grok-4 is the stable
+# baseline) — the serves deploy wires the actual id via env.
+_DEFAULT_OLLAMA_CHAT_MODEL = "gemma3:12b-it-qat"
+_DEFAULT_GROK_MODEL = "grok-4"
+
 
 def _parse_embed_dim(raw: str) -> int:
     try:
@@ -49,10 +61,14 @@ class Config:
     socket: str
     auth_seed_path: str | None
 
+    llm_provider: str
     ollama_url: str
     chat_model: str
     embed_model: str
     embed_dim: int
+
+    xai_api_key: str | None
+    xai_base_url: str
 
     db_url: str
 
@@ -79,16 +95,40 @@ class Config:
                 "JEFF_DB_URL is required (e.g. postgresql://jeff:pwd@host:5432/jeff)"
             )
 
+        provider = e.get("JEFF_LLM_PROVIDER", "ollama").strip().lower()
+        if provider not in _KNOWN_PROVIDERS:
+            raise ConfigError(
+                f"JEFF_LLM_PROVIDER must be one of {sorted(_KNOWN_PROVIDERS)}; got {provider!r}"
+            )
+
+        # Chat model: provider-agnostic JEFF_CHAT_MODEL overrides everywhere;
+        # otherwise fall back to a provider-specific default (and the legacy
+        # OLLAMA_CHAT_MODEL under the ollama provider).
+        generic_model = e.get("JEFF_CHAT_MODEL")
+        if provider == "ollama":
+            chat_model = generic_model or e.get("OLLAMA_CHAT_MODEL", _DEFAULT_OLLAMA_CHAT_MODEL)
+        else:  # grok
+            chat_model = generic_model or _DEFAULT_GROK_MODEL
+
+        # Fail fast: don't construct a Grok provider with no key and discover it
+        # via a wire 401 mid-turn.
+        xai_api_key = e.get("XAI_API_KEY") or None
+        if provider == "grok" and not xai_api_key:
+            raise ConfigError("JEFF_LLM_PROVIDER=grok requires XAI_API_KEY to be set")
+
         return Config(
             name=e.get("JEFF_NAME", "jeff"),
             description=e.get("JEFF_DESCRIPTION", "Personal AI assistant"),
             allowlist=_csv(e.get("JEFF_ALLOWLIST")),
             socket=e.get("ENSEMBLE_SOCKET", "/run/ensemble/sock"),
             auth_seed_path=e.get("ENSEMBLE_AUTH_SEED") or None,
+            llm_provider=provider,
             ollama_url=e.get("OLLAMA_URL", "http://localhost:11434"),
-            chat_model=e.get("OLLAMA_CHAT_MODEL", "gemma3:12b-it-qat"),
+            chat_model=chat_model,
             embed_model=e.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
             embed_dim=_parse_embed_dim(e.get("OLLAMA_EMBED_DIM", "768")),
+            xai_api_key=xai_api_key,
+            xai_base_url=e.get("XAI_BASE_URL", "https://api.x.ai/v1"),
             db_url=db_url,
             recall_k=int(e.get("MEMORY_RECALL_K", "5")),
             recent_turns=int(e.get("MEMORY_RECENT_TURNS", "10")),
