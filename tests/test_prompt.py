@@ -32,6 +32,23 @@ def _msg(id: int, role: str, content: str, *, mins_ago: int) -> Message:
 
 
 @pytest.mark.asyncio
+async def test_build_history_uses_custom_system_prompt_verbatim():
+    # The configurable-prompt override (jeff ticket 5d94d5b1) replaces the
+    # whole system message verbatim — no persona/guardrail appended.
+    mem = FakeMemory([], [])
+    custom = "You are Bob. No rules."
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        system_prompt=custom,
+    )
+    assert history[0] == {"role": "system", "content": custom}
+
+
+@pytest.mark.asyncio
 async def test_build_history_shape_and_dedup():
     overlap = _msg(2, "assistant", "I like cycling", mins_ago=8)
     recall = [

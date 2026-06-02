@@ -31,6 +31,60 @@ _KNOWN_PROVIDERS = frozenset({"ollama", "grok"})
 _DEFAULT_OLLAMA_CHAT_MODEL = "gemma3:12b-it-qat"
 _DEFAULT_GROK_MODEL = "grok-4"
 
+# Upper bound on a custom system prompt (characters). Generous — several pages
+# of persona text — but bounded so a runaway file/env can't blow the context
+# window or per-turn token cost. Operator-controlled, so fail fast at load.
+_SYSTEM_PROMPT_MAX_CHARS = 32_768
+
+
+def _resolve_system_prompt(e: dict[str, str]) -> tuple[str, str]:
+    """Resolve the active system prompt and a source label for logging.
+
+    Precedence: ``JEFF_SYSTEM_PROMPT_FILE`` > ``JEFF_SYSTEM_PROMPT`` > the
+    built-in ``prompt.SYSTEM_PROMPT`` default. The override replaces the
+    entire prompt verbatim (after a surrounding-whitespace strip) — Jeff is
+    single-user (ACL = allowlist of just the operator), so the operator owns
+    the whole prompt, guardrail and all (jeff ticket 5d94d5b1). Returns
+    ``(prompt_text, source)`` with source one of ``"file" | "env" | "default"``.
+    """
+    path = e.get("JEFF_SYSTEM_PROMPT_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as ex:
+            # Fail fast — don't silently fall back to the default when the
+            # operator explicitly pointed at a file that can't be read.
+            raise ConfigError(
+                f"JEFF_SYSTEM_PROMPT_FILE could not be read ({path!r}): "
+                f"{ex.strerror or ex}"
+            ) from ex
+        text = text.strip()
+        if not text:
+            raise ConfigError(f"JEFF_SYSTEM_PROMPT_FILE is empty: {path!r}")
+        _check_prompt_length(text, "JEFF_SYSTEM_PROMPT_FILE")
+        return text, "file"
+
+    inline = e.get("JEFF_SYSTEM_PROMPT")
+    if inline and inline.strip():
+        text = inline.strip()
+        _check_prompt_length(text, "JEFF_SYSTEM_PROMPT")
+        return text, "env"
+
+    # Lazy import: prompt.py pulls in memory (numpy/pgvector/psycopg), and
+    # config is imported early + in lightweight unit tests. Only pay that
+    # cost when no override is supplied.
+    from .prompt import SYSTEM_PROMPT
+
+    return SYSTEM_PROMPT, "default"
+
+
+def _check_prompt_length(text: str, var: str) -> None:
+    if len(text) > _SYSTEM_PROMPT_MAX_CHARS:
+        raise ConfigError(
+            f"{var} too long: {len(text)} chars (max {_SYSTEM_PROMPT_MAX_CHARS})"
+        )
+
 
 def _parse_embed_dim(raw: str) -> int:
     try:
@@ -69,6 +123,9 @@ class Config:
 
     xai_api_key: str | None
     xai_base_url: str
+
+    system_prompt: str
+    system_prompt_source: str
 
     db_url: str
 
@@ -116,6 +173,8 @@ class Config:
         if provider == "grok" and not xai_api_key:
             raise ConfigError("JEFF_LLM_PROVIDER=grok requires XAI_API_KEY to be set")
 
+        system_prompt, system_prompt_source = _resolve_system_prompt(e)
+
         return Config(
             name=e.get("JEFF_NAME", "jeff"),
             description=e.get("JEFF_DESCRIPTION", "Personal AI assistant"),
@@ -129,6 +188,8 @@ class Config:
             embed_dim=_parse_embed_dim(e.get("OLLAMA_EMBED_DIM", "768")),
             xai_api_key=xai_api_key,
             xai_base_url=e.get("XAI_BASE_URL", "https://api.x.ai/v1"),
+            system_prompt=system_prompt,
+            system_prompt_source=system_prompt_source,
             db_url=db_url,
             recall_k=int(e.get("MEMORY_RECALL_K", "5")),
             recent_turns=int(e.get("MEMORY_RECENT_TURNS", "10")),

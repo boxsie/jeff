@@ -1,6 +1,7 @@
 import pytest
 
-from jeff.config import Config, ConfigError
+from jeff.config import _SYSTEM_PROMPT_MAX_CHARS, Config, ConfigError
+from jeff.prompt import SYSTEM_PROMPT
 
 
 def test_from_env_requires_db_url():
@@ -118,6 +119,89 @@ def test_provider_name_normalised():
         {"JEFF_DB_URL": "postgresql://x", "JEFF_LLM_PROVIDER": " Grok ", "XAI_API_KEY": "k"}
     )
     assert cfg.llm_provider == "grok"
+
+
+def test_system_prompt_defaults_to_builtin():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.system_prompt == SYSTEM_PROMPT
+    assert cfg.system_prompt_source == "default"
+
+
+def test_system_prompt_inline_env_overrides_verbatim():
+    cfg = Config.from_env(
+        {"JEFF_DB_URL": "postgresql://x", "JEFF_SYSTEM_PROMPT": "You are Bob."}
+    )
+    # Verbatim — nothing appended (no forced guardrail; single-user assistant).
+    assert cfg.system_prompt == "You are Bob."
+    assert cfg.system_prompt_source == "env"
+
+
+def test_system_prompt_inline_env_is_stripped():
+    cfg = Config.from_env(
+        {"JEFF_DB_URL": "postgresql://x", "JEFF_SYSTEM_PROMPT": "  spaced  \n"}
+    )
+    assert cfg.system_prompt == "spaced"
+
+
+def test_system_prompt_blank_env_falls_back_to_default():
+    # An empty/whitespace env value is treated as "unset" (k8s may inject "").
+    cfg = Config.from_env(
+        {"JEFF_DB_URL": "postgresql://x", "JEFF_SYSTEM_PROMPT": "   "}
+    )
+    assert cfg.system_prompt == SYSTEM_PROMPT
+    assert cfg.system_prompt_source == "default"
+
+
+def test_system_prompt_file_used_and_stripped(tmp_path):
+    p = tmp_path / "prompt.txt"
+    # Trailing newline (e.g. from `op read`) must be stripped.
+    p.write_text("You are a file-defined assistant.\n", encoding="utf-8")
+    cfg = Config.from_env(
+        {"JEFF_DB_URL": "postgresql://x", "JEFF_SYSTEM_PROMPT_FILE": str(p)}
+    )
+    assert cfg.system_prompt == "You are a file-defined assistant."
+    assert cfg.system_prompt_source == "file"
+
+
+def test_system_prompt_file_beats_inline_env(tmp_path):
+    p = tmp_path / "prompt.txt"
+    p.write_text("from file", encoding="utf-8")
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_SYSTEM_PROMPT_FILE": str(p),
+            "JEFF_SYSTEM_PROMPT": "from env",
+        }
+    )
+    assert cfg.system_prompt == "from file"
+    assert cfg.system_prompt_source == "file"
+
+
+def test_system_prompt_missing_file_raises(tmp_path):
+    missing = tmp_path / "nope.txt"
+    with pytest.raises(ConfigError, match="JEFF_SYSTEM_PROMPT_FILE"):
+        Config.from_env(
+            {"JEFF_DB_URL": "postgresql://x", "JEFF_SYSTEM_PROMPT_FILE": str(missing)}
+        )
+
+
+def test_system_prompt_empty_file_raises(tmp_path):
+    p = tmp_path / "empty.txt"
+    p.write_text("   \n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="empty"):
+        Config.from_env(
+            {"JEFF_DB_URL": "postgresql://x", "JEFF_SYSTEM_PROMPT_FILE": str(p)}
+        )
+
+
+def test_system_prompt_over_length_rejected():
+    with pytest.raises(ConfigError, match="too long"):
+        Config.from_env(
+            {
+                "JEFF_DB_URL": "postgresql://x",
+                "JEFF_SYSTEM_PROMPT": "x" * (_SYSTEM_PROMPT_MAX_CHARS + 1),
+            }
+        )
 
 
 def test_from_env_overrides():

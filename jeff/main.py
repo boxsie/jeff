@@ -44,6 +44,7 @@ async def handle_turn(
             text,
             recent_turns=cfg.recent_turns,
             recall_k=cfg.recall_k,
+            system_prompt=cfg.system_prompt,
         )
         reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
@@ -104,6 +105,7 @@ async def run(cfg: Config) -> None:
             max_embed_dim=cfg.ollama_max_embed_dim,
         ) as embed_client, make_chat_provider(cfg) as chat_provider:
             log.info("chat provider=%s model=%s", cfg.llm_provider, cfg.chat_model)
+            log.info("system prompt source=%s", cfg.system_prompt_source)
             memory = await Memory.create(
                 pool,
                 embed_client,
