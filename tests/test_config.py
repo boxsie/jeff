@@ -218,3 +218,47 @@ def test_from_env_overrides():
     assert cfg.recall_k == 3
     assert cfg.recent_turns == 4
     assert cfg.embed_dim == 1024
+
+
+def test_tools_defaults():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.tools_enabled is True
+    assert cfg.max_tool_iters == 5
+    assert cfg.tool_timeout_s == 30.0
+
+
+def test_tools_can_be_disabled():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x", "JEFF_TOOLS_ENABLED": "false"})
+    assert cfg.tools_enabled is False
+
+
+def test_search_defaults_off_with_localhost_url():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.search_enabled is False
+    assert cfg.searxng_url == "http://localhost:8888"
+    assert cfg.searxng_auth is None
+
+
+def test_search_url_and_auth_parsed():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_SEARCH_ENABLED": "true",
+            "JEFF_SEARXNG_URL": "http://searxng-service.searxng.svc:8080",
+            "JEFF_SEARXNG_AUTH": "Bearer tok",
+        }
+    )
+    assert cfg.search_enabled is True
+    assert cfg.searxng_url == "http://searxng-service.searxng.svc:8080"
+    assert cfg.searxng_auth == "Bearer tok"
+
+
+def test_search_enabled_without_url_fails_fast():
+    with pytest.raises(ConfigError, match="JEFF_SEARXNG_URL"):
+        Config.from_env(
+            {
+                "JEFF_DB_URL": "postgresql://x",
+                "JEFF_SEARCH_ENABLED": "true",
+                "JEFF_SEARXNG_URL": "",
+            }
+        )

@@ -7,7 +7,40 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jeff.memory import Message
-from jeff.prompt import SYSTEM_PROMPT, build_history
+from jeff.prompt import SYSTEM_PROMPT, build_history, compose_system_prompt
+
+
+_BASE = "You are Jeff."
+
+
+def test_compose_keeps_base_first_and_always_adds_formatting():
+    out = compose_system_prompt(_BASE, [])
+    assert out.startswith(_BASE)
+    # No tools → no Tools section, but the Markdown/formatting note is always on.
+    assert "## Tools" not in out
+    assert "## Formatting" in out
+    assert "Markdown" in out
+    assert "[label](url)" in out
+
+
+def test_compose_lists_tools_and_search_guidance():
+    out = compose_system_prompt(_BASE, ["get_time", "image_search", "web_search"])
+    assert "## Tools" in out
+    # Tool names surfaced for the model.
+    for name in ("get_time", "image_search", "web_search"):
+        assert name in out
+    # Search-specific behaviour: links only, cite, don't claim to have viewed.
+    assert "cannot open, read, or view" in out
+    assert "cite the URLs" in out
+
+
+def test_compose_omits_search_guidance_when_no_search_tool():
+    out = compose_system_prompt(_BASE, ["get_time"])
+    assert "## Tools" in out
+    assert "get_time" in out
+    # The search-citation paragraph must not appear for a non-search tool.
+    assert "web_search and image_search" not in out
+    assert "cannot open, read, or view" not in out
 
 
 class FakeMemory:

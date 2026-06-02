@@ -71,6 +71,34 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `OLLAMA_EMBED_DIM` | `768` | Embedding vector dimensionality (must match the model) |
 | `MEMORY_RECALL_K` | `5` | How many semantically-similar past messages to retrieve per turn |
 | `MEMORY_RECENT_TURNS` | `10` | How many most-recent messages to include per turn |
+| `JEFF_TOOLS_ENABLED` | `true` | Master switch for tool use. When off (or the registry is empty) the turn loop is byte-identical to the no-tools single-shot path. |
+| `JEFF_MAX_TOOL_ITERS` | `5` | Max provider↔tool round-trips per turn before a graceful "tool-use limit" reply. |
+| `JEFF_TOOL_TIMEOUT_S` | `30` | Per-tool execution timeout (seconds). A timed-out tool returns a safe error to the model; the turn survives. |
+| `JEFF_SEARCH_ENABLED` | `false` | Enable the SearXNG-backed `web_search` / `image_search` tools (also requires `JEFF_TOOLS_ENABLED`). |
+| `JEFF_SEARXNG_URL` | `http://localhost:8888` | SearXNG JSON-API base URL. The real in-cluster URL is **not committed** — it arrives via the serves ConfigMap. Startup fails fast if search is enabled but this is empty. |
+| `JEFF_SEARXNG_AUTH` | _none_ | Optional full `Authorization` header value if the SearXNG instance requires auth (e.g. `Basic …` / `Bearer …`). Never logged. |
+
+## Tools
+
+When `JEFF_TOOLS_ENABLED` is on, the LLM can call registered tools mid-turn: the
+turn handler runs an execute-and-loop (provider → tool calls → results fed back
+→ repeat, bounded by `JEFF_MAX_TOOL_ITERS`). Only the final assistant message is
+sent to the peer and stored in memory — intermediate tool chatter is working
+state, not a conversational turn. Every tool failure (unknown tool, bad args,
+raise, timeout) becomes a short safe `error: …` string for the model; a tool
+fault never crashes the turn, and no exception text reaches the model.
+
+At startup a **capabilities addendum** is appended to the active system prompt
+(file / env / built-in default) describing the registered tools and how to use
+them, plus a note that the chat client renders Markdown (so Jeff writes
+`[label](url)` links and cites search results). The addendum tracks the actual
+registry — it never advertises a tool that isn't enabled — and the search
+guidance only appears when a search tool is registered.
+
+Tools available today:
+
+- **`get_time`** — current UTC time (zero-dependency built-in).
+- **`web_search` / `image_search`** — query the self-hosted [SearXNG](https://docs.searxng.org/) metasearch proxy (enable with `JEFF_SEARCH_ENABLED`). Jeff only ever talks to SearXNG, and returns **links + text only**: it does not fetch the result pages or image bytes (auto-fetching would re-leak interest to third parties and is an SSRF vector). The model surfaces citations the operator clicks.
 
 ## Memory
 
@@ -103,4 +131,7 @@ The memory tests spin up an ephemeral pgvector Postgres via `testcontainers` (Do
 
 ## Out of scope (today)
 
-Tool use (kubectl, shell, file read), push notifications, streaming token-by-token replies, multi-modal — Phase 1+.
+Push notifications, streaming token-by-token replies, multi-modal (vision/image
+input), file transfer, and proactive messaging — tracked in the capabilities
+phase. Tool use itself has landed (function-calling foundation + SearXNG
+web/image search); kubectl/shell/file-read tools are deliberately **not** built.

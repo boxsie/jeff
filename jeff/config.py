@@ -100,6 +100,13 @@ def _parse_embed_dim(raw: str) -> int:
     return n
 
 
+def _parse_bool(raw: str | None) -> bool:
+    """Parse a permissive boolean env value. Anything truthy-looking is True."""
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _csv(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -131,6 +138,14 @@ class Config:
 
     recall_k: int
     recent_turns: int
+
+    tools_enabled: bool
+    max_tool_iters: int
+    tool_timeout_s: float
+
+    search_enabled: bool
+    searxng_url: str
+    searxng_auth: str | None
 
     max_inflight: int
     per_peer_concurrency: int
@@ -175,6 +190,17 @@ class Config:
 
         system_prompt, system_prompt_source = _resolve_system_prompt(e)
 
+        # Search: the in-cluster SearXNG URL is NOT committed (leaky-info rule)
+        # — it arrives via the serves ConfigMap; the code default is localhost.
+        # Fail fast if search is turned on but the URL was explicitly cleared,
+        # mirroring the provider=grok + missing-key precedent: an operator who
+        # enables search and forgets the endpoint should hear about it at load,
+        # not as a runtime connection error mid-turn.
+        search_enabled = _parse_bool(e.get("JEFF_SEARCH_ENABLED", "false"))
+        searxng_url = e.get("JEFF_SEARXNG_URL", "http://localhost:8888").strip()
+        if search_enabled and not searxng_url:
+            raise ConfigError("JEFF_SEARCH_ENABLED is on but JEFF_SEARXNG_URL is empty")
+
         return Config(
             name=e.get("JEFF_NAME", "jeff"),
             description=e.get("JEFF_DESCRIPTION", "Personal AI assistant"),
@@ -193,6 +219,12 @@ class Config:
             db_url=db_url,
             recall_k=int(e.get("MEMORY_RECALL_K", "5")),
             recent_turns=int(e.get("MEMORY_RECENT_TURNS", "10")),
+            tools_enabled=_parse_bool(e.get("JEFF_TOOLS_ENABLED", "true")),
+            max_tool_iters=int(e.get("JEFF_MAX_TOOL_ITERS", "5")),
+            tool_timeout_s=float(e.get("JEFF_TOOL_TIMEOUT_S", "30")),
+            search_enabled=search_enabled,
+            searxng_url=searxng_url,
+            searxng_auth=e.get("JEFF_SEARXNG_AUTH") or None,
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),

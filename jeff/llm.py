@@ -22,8 +22,21 @@ from typing import Protocol, Sequence, runtime_checkable
 import httpx
 
 from ._http import ResponseTooLargeError, read_bounded, safe_excerpt
+from .chat_types import ChatResult, ToolCall, parse_openai_tool_calls
 from .config import Config, ConfigError
 from .ollama import DEFAULT_MAX_RESP_BYTES, Ollama
+
+# Re-exported so callers can keep importing the canonical shapes from `jeff.llm`
+# (their natural home is the provider layer); the definitions live in
+# `chat_types` only to break the llm<->ollama import cycle.
+__all__ = [
+    "ChatProvider",
+    "ChatResult",
+    "LLMError",
+    "ToolCall",
+    "XaiProvider",
+    "make_chat_provider",
+]
 
 
 class LLMError(Exception):
@@ -35,11 +48,21 @@ class ChatProvider(Protocol):
     """The contract Jeff's turn loop depends on.
 
     A provider is an async context manager (so the loop can `async with` it for
-    connection-pool lifecycle) exposing a single `chat` call. The signature
-    matches `Ollama.chat` on purpose — `Ollama` satisfies this unchanged.
+    connection-pool lifecycle). `chat` is the simple single-shot path (returns
+    the assistant string); `complete` is the tool-aware path (returns a
+    `ChatResult` and accepts optional `tools` JSON-schema specs). The signatures
+    match `Ollama` on purpose — `Ollama` satisfies this unchanged.
     """
 
     async def chat(self, messages: Sequence[dict], *, model: str) -> str: ...
+
+    async def complete(
+        self,
+        messages: Sequence[dict],
+        *,
+        model: str,
+        tools: Sequence[dict] | None = None,
+    ) -> ChatResult: ...
 
     async def __aenter__(self) -> "ChatProvider": ...
 
@@ -82,8 +105,35 @@ class XaiProvider:
         self._max_resp_bytes = max_resp_bytes
 
     async def chat(self, messages: Sequence[dict], *, model: str) -> str:
-        """POST /chat/completions. Returns the assistant message content."""
-        payload = {"model": model, "messages": list(messages), "stream": False}
+        """POST /chat/completions. Returns the assistant message content.
+
+        The single-shot path — no tools. Thin wrapper over `complete`; raises
+        if the model didn't return a content string (e.g. it tried to call a
+        tool when none were offered, which shouldn't happen here).
+        """
+        res = await self.complete(messages, model=model)
+        if res.content is None:
+            raise LLMError("chat: malformed response (no choices[0].message.content)")
+        return res.content
+
+    async def complete(
+        self,
+        messages: Sequence[dict],
+        *,
+        model: str,
+        tools: Sequence[dict] | None = None,
+    ) -> ChatResult:
+        """POST /chat/completions, returning content and/or tool-call requests.
+
+        Messages are already in the OpenAI canonical shape Grok speaks (the
+        turn loop builds them that way), so they pass straight through —
+        including assistant `tool_calls` and `role:"tool"` follow-ups. `tools`
+        is added to the payload only when supplied, so the no-tools payload is
+        byte-identical to the pre-tool client.
+        """
+        payload: dict = {"model": model, "messages": list(messages), "stream": False}
+        if tools:
+            payload["tools"] = list(tools)
         try:
             async with self._client.stream("POST", "/chat/completions", json=payload) as resp:
                 try:
@@ -110,10 +160,14 @@ class XaiProvider:
             raise LLMError(f"chat: malformed response (no choices); keys={keys}")
         first = choices[0]
         msg = first.get("message") if isinstance(first, dict) else None
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(content, str):
-            raise LLMError("chat: malformed response (no choices[0].message.content)")
-        return content
+        if not isinstance(msg, dict):
+            raise LLMError("chat: malformed response (no choices[0].message)")
+        content = msg.get("content")
+        content = content if isinstance(content, str) else None
+        tool_calls = parse_openai_tool_calls(msg.get("tool_calls"))
+        if content is None and not tool_calls:
+            raise LLMError("chat: malformed response (no content or tool_calls)")
+        return ChatResult(content=content, tool_calls=tool_calls)
 
     async def aclose(self) -> None:
         await self._client.aclose()

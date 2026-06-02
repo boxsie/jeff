@@ -11,14 +11,25 @@ from psycopg_pool import AsyncConnectionPool
 
 from .config import Config
 from .dispatch import DispatchPolicy, TurnDispatcher
-from .llm import ChatProvider, make_chat_provider
+from .llm import ChatProvider, ChatResult
+from .llm import make_chat_provider
 from .memory import Memory
 from .ollama import Ollama
-from .prompt import build_history
+from .prompt import build_history, compose_system_prompt
 from .screen import screen_text
+from .searxng import SearxngClient
+from .tools import ToolRegistry, build_registry
 
 
 log = logging.getLogger("jeff")
+
+# Sent to the peer when the tool loop hits its iteration cap without the model
+# producing a final answer. No exception/internal text — same discipline as the
+# silent-failure path (pairs with ticket 2b5e93f8).
+_TOOL_CAP_MESSAGE = (
+    "Sorry — I couldn't finish working through that within my tool-use limit. "
+    "Could you try rephrasing or narrowing the request?"
+)
 
 
 async def handle_turn(
@@ -28,6 +39,8 @@ async def handle_turn(
     cfg: Config,
     peer: str,
     text: str,
+    registry: ToolRegistry | None = None,
+    system_prompt: str | None = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -35,6 +48,17 @@ async def handle_turn(
     semaphore + global in-flight cap. Exceptions are still caught here
     because the dispatcher's wrapper logs them generically; we want a
     handler-specific log line for debuggability.
+
+    `system_prompt` is the effective prompt (base + capabilities addendum)
+    composed once at startup; when omitted it falls back to `cfg.system_prompt`
+    so existing callers/tests are unaffected.
+
+    When `registry` has tools and tools are enabled, the reply is produced by
+    the execute-and-loop (`_run_tool_loop`); otherwise the single-shot
+    `chat()` path runs, byte-identical to the pre-tool behaviour. Either way
+    only the *final* assistant text is stored in memory and sent — intermediate
+    tool calls/results are working state, not conversational turns, so they
+    don't pollute recall.
     """
     try:
         await memory.remember(peer, "user", text)
@@ -44,9 +68,12 @@ async def handle_turn(
             text,
             recent_turns=cfg.recent_turns,
             recall_k=cfg.recall_k,
-            system_prompt=cfg.system_prompt,
+            system_prompt=system_prompt or cfg.system_prompt,
         )
-        reply = await chat_provider.chat(history, model=cfg.chat_model)
+        if registry is not None and cfg.tools_enabled and len(registry):
+            reply = await _run_tool_loop(chat_provider, registry, history, cfg)
+        else:
+            reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
         await memory.remember(peer, "assistant", reply)
     except Exception as e:
@@ -55,6 +82,56 @@ async def handle_turn(
         # ollama._safe_excerpt) and don't log the traceback (it embeds the
         # same string via __cause__). One operator-readable line, no PII.
         log.error("turn failed peer=%s exc=%s", peer, type(e).__name__)
+
+
+def _assistant_tool_message(result: ChatResult) -> dict:
+    """Render a tool-calling assistant turn back into OpenAI-canonical form.
+
+    This is the message the model must see echoed before its tool results, so
+    it can correlate each `tool_call_id`. Content is preserved if the model
+    narrated alongside the calls.
+    """
+    return {
+        "role": "assistant",
+        "content": result.content or "",
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": tc.arguments},
+            }
+            for tc in result.tool_calls
+        ],
+    }
+
+
+async def _run_tool_loop(
+    chat_provider: ChatProvider,
+    registry: ToolRegistry,
+    history: list[dict],
+    cfg: Config,
+) -> str:
+    """Call the provider, execute any tool calls, repeat until a final answer.
+
+    Bounded by `cfg.max_tool_iters`. Each tool result is fed back as a
+    `role:"tool"` message; the registry guarantees a safe string even for
+    unknown tools / bad args / raises / timeouts, so the loop never crashes on
+    a tool fault. Returns the model's final content, or a graceful cap message
+    if it never stops calling tools.
+    """
+    specs = registry.specs()
+    messages = list(history)
+    for _ in range(cfg.max_tool_iters):
+        result = await chat_provider.complete(messages, model=cfg.chat_model, tools=specs)
+        if not result.tool_calls:
+            return result.content or ""
+        log.info("tool turn: calls=%s", ",".join(tc.name for tc in result.tool_calls))
+        messages.append(_assistant_tool_message(result))
+        for tc in result.tool_calls:
+            out = await registry.dispatch(tc.name, tc.arguments, timeout=cfg.tool_timeout_s)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+    log.warning("tool loop hit iteration cap (%d)", cfg.max_tool_iters)
+    return _TOOL_CAP_MESSAGE
 
 
 def _policy_from_config(cfg: Config) -> DispatchPolicy:
@@ -99,13 +176,32 @@ async def run(cfg: Config) -> None:
         # and fits the GPU); chat goes to whatever provider cfg selects. When
         # the chat provider is also ollama these are two clients to the same
         # URL — cheap, and it keeps the embed path independent of chat config.
-        async with Ollama(
-            cfg.ollama_url,
-            max_resp_bytes=cfg.ollama_max_resp_bytes,
-            max_embed_dim=cfg.ollama_max_embed_dim,
-        ) as embed_client, make_chat_provider(cfg) as chat_provider:
+        async with (
+            Ollama(
+                cfg.ollama_url,
+                max_resp_bytes=cfg.ollama_max_resp_bytes,
+                max_embed_dim=cfg.ollama_max_embed_dim,
+            ) as embed_client,
+            make_chat_provider(cfg) as chat_provider,
+            SearxngClient(
+                cfg.searxng_url,
+                auth=cfg.searxng_auth,
+                max_resp_bytes=cfg.ollama_max_resp_bytes,
+            ) as searxng,
+        ):
             log.info("chat provider=%s model=%s", cfg.llm_provider, cfg.chat_model)
             log.info("system prompt source=%s", cfg.system_prompt_source)
+            registry = build_registry(cfg, searxng=searxng)
+            if cfg.tools_enabled and len(registry):
+                # Names only — never tool args (the leaky-info discipline).
+                log.info("tools enabled: %s", ", ".join(registry.names()))
+            else:
+                log.info("tools disabled")
+            # Compose the effective prompt once: operator's base (file/env/
+            # default) + a capabilities addendum describing the registered tools
+            # and Markdown rendering. Tools off → addendum is just the formatting
+            # note. Built once, reused for every turn.
+            system_prompt = compose_system_prompt(cfg.system_prompt, registry.names())
             memory = await Memory.create(
                 pool,
                 embed_client,
@@ -133,7 +229,16 @@ async def run(cfg: Config) -> None:
                     )
 
                     async def _on_turn(peer: str, text: str) -> None:
-                        await handle_turn(handle, memory, chat_provider, cfg, peer, text)
+                        await handle_turn(
+                            handle,
+                            memory,
+                            chat_provider,
+                            cfg,
+                            peer,
+                            text,
+                            registry,
+                            system_prompt,
+                        )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -162,3 +164,174 @@ async def test_transport_failure_is_generic_and_keyless():
 def test_construct_without_key_rejected():
     with pytest.raises(ValueError, match="api_key"):
         XaiProvider(api_key="")
+
+
+# --- XaiProvider.complete (tool-calling) -----------------------------------
+
+
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get the time.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+]
+
+
+@pytest.mark.asyncio
+async def test_complete_sends_tools_and_parses_tool_calls():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = req.read()
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call_abc",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_time",
+                                        "arguments": '{"tz":"utc"}',
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    provider = _xai(handler)
+    try:
+        res = await provider.complete(
+            [{"role": "user", "content": "what time is it"}],
+            model="grok-4",
+            tools=_TOOLS,
+        )
+    finally:
+        await provider.aclose()
+
+    assert b'"tools"' in seen["body"]
+    assert res.content is None
+    assert len(res.tool_calls) == 1
+    tc = res.tool_calls[0]
+    assert tc.id == "call_abc"
+    assert tc.name == "get_time"
+    assert tc.arguments == '{"tz":"utc"}'
+
+
+@pytest.mark.asyncio
+async def test_complete_without_tools_omits_tools_key():
+    """No-tools payload must stay byte-identical to the pre-tool client."""
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = req.read()
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"role": "assistant", "content": "hi"}}]},
+        )
+
+    provider = _xai(handler)
+    try:
+        res = await provider.complete([{"role": "user", "content": "x"}], model="grok-4")
+    finally:
+        await provider.aclose()
+
+    assert b'"tools"' not in seen["body"]
+    assert res.content == "hi"
+    assert res.tool_calls == ()
+
+
+@pytest.mark.asyncio
+async def test_complete_round_trips_tool_result_into_final_answer():
+    """A follow-up call carrying a role:tool message yields final content."""
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = req.read()
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"role": "assistant", "content": "It is noon UTC."}}
+                ]
+            },
+        )
+
+    provider = _xai(handler)
+    messages = [
+        {"role": "user", "content": "time?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "get_time", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_abc", "content": "noon UTC"},
+    ]
+    try:
+        res = await provider.complete(messages, model="grok-4", tools=_TOOLS)
+    finally:
+        await provider.aclose()
+
+    assert res.content == "It is noon UTC."
+    assert res.tool_calls == ()
+    # The tool result rode through to the provider verbatim.
+    assert b'"tool_call_id":"call_abc"' in seen["body"]
+    assert _API_KEY not in seen["body"].decode()
+
+
+@pytest.mark.asyncio
+async def test_complete_arguments_object_is_serialised_to_string():
+    """Some providers emit arguments as an object; canonical form is a string."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "echo",
+                                        "arguments": {"message": "hi"},
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    provider = _xai(handler)
+    try:
+        res = await provider.complete([], model="grok-4", tools=_TOOLS)
+    finally:
+        await provider.aclose()
+
+    assert len(res.tool_calls) == 1
+    tc = res.tool_calls[0]
+    assert tc.name == "echo"
+    # Missing id was synthesised; object arguments serialised to a JSON string.
+    assert tc.id == "call_0"
+    assert json.loads(tc.arguments) == {"message": "hi"}

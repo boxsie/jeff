@@ -5,10 +5,13 @@ from __future__ import annotations
 import ensemble
 import pytest
 
+from jeff.chat_types import ChatResult, ToolCall
 from jeff.config import Config
 from jeff.dispatch import DispatchPolicy, TurnDispatcher
 from jeff.main import _drain_events, handle_turn
 from jeff.memory import MAX_CONTENT_BYTES, Memory
+from jeff.tools import ToolRegistry
+from jeff.tools.builtins import GetTimeTool
 
 
 class FakeHandle:
@@ -83,6 +86,151 @@ async def test_handle_turn_writes_user_calls_chat_sends_writes_assistant():
         "role": "user",
         "content": "<peer_message>ping</peer_message>",
     }
+
+
+class FakeToolProvider:
+    """A ChatProvider whose `complete` returns a scripted sequence of results.
+
+    Each call pops the next `ChatResult`; if the script is exhausted it returns
+    the last one forever (useful for the cap test). Records every `messages`
+    list it was handed so tests can assert the tool round-trip.
+    """
+
+    def __init__(self, script: list[ChatResult]):
+        self._script = script
+        self.calls: list[list[dict]] = []
+
+    async def complete(self, messages, *, model, tools=None):
+        self.calls.append(list(messages))
+        idx = min(len(self.calls) - 1, len(self._script) - 1)
+        return self._script[idx]
+
+    async def chat(self, messages, *, model):  # pragma: no cover - loop uses complete
+        res = await self.complete(messages, model=model)
+        return res.content or ""
+
+
+def _tools_cfg(**extra) -> Config:
+    env = {"JEFF_DB_URL": "postgresql://unused", "JEFF_ALLOWLIST": "EpeerD"}
+    env.update(extra)
+    return Config.from_env(env)
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_executes_tool_then_sends_final_answer_once():
+    handle = FakeHandle()
+    memory = FakeMemory()
+    registry = ToolRegistry([GetTimeTool()])
+    provider = FakeToolProvider(
+        [
+            ChatResult(
+                content=None,
+                tool_calls=(ToolCall(id="c1", name="get_time", arguments="{}"),),
+            ),
+            ChatResult(content="It is now-ish.", tool_calls=()),
+        ]
+    )
+    cfg = _tools_cfg()
+
+    await handle_turn(handle, memory, provider, cfg, "EpeerD", "what time is it", registry)
+
+    # Exactly one reply — the final answer, not the intermediate tool chatter.
+    assert handle.sent == [("EpeerD", "It is now-ish.")]
+    # Only the user turn and the final assistant turn are persisted.
+    assert memory.remembered == [
+        ("EpeerD", "user", "what time is it"),
+        ("EpeerD", "assistant", "It is now-ish."),
+    ]
+    # The second provider call carried the assistant tool-call turn + a tool
+    # result message correlated by id.
+    second = provider.calls[1]
+    assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in second)
+    tool_msgs = [m for m in second if m.get("role") == "tool"]
+    assert tool_msgs and tool_msgs[0]["tool_call_id"] == "c1"
+    assert "Current UTC time" in tool_msgs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_unknown_tool_feeds_safe_error_and_recovers():
+    handle = FakeHandle()
+    memory = FakeMemory()
+    registry = ToolRegistry([GetTimeTool()])
+    provider = FakeToolProvider(
+        [
+            ChatResult(
+                content=None,
+                tool_calls=(ToolCall(id="c1", name="no_such_tool", arguments="{}"),),
+            ),
+            ChatResult(content="Sorry, I couldn't do that.", tool_calls=()),
+        ]
+    )
+    cfg = _tools_cfg()
+
+    await handle_turn(handle, memory, provider, cfg, "EpeerD", "do a thing", registry)
+
+    assert handle.sent == [("EpeerD", "Sorry, I couldn't do that.")]
+    tool_msgs = [m for m in provider.calls[1] if m.get("role") == "tool"]
+    assert tool_msgs and tool_msgs[0]["content"].startswith("error:")
+    assert "unknown tool" in tool_msgs[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_cap_sends_graceful_message_exactly_once():
+    handle = FakeHandle()
+    memory = FakeMemory()
+    registry = ToolRegistry([GetTimeTool()])
+    # Always asks for a tool — never converges.
+    provider = FakeToolProvider(
+        [
+            ChatResult(
+                content=None,
+                tool_calls=(ToolCall(id="c1", name="get_time", arguments="{}"),),
+            )
+        ]
+    )
+    cfg = _tools_cfg(JEFF_MAX_TOOL_ITERS="2")
+
+    await handle_turn(handle, memory, provider, cfg, "EpeerD", "loop forever", registry)
+
+    # Provider called exactly the cap number of times, one graceful reply sent.
+    assert len(provider.calls) == 2
+    assert len(handle.sent) == 1
+    to_addr, reply = handle.sent[0]
+    assert to_addr == "EpeerD"
+    assert "tool-use limit" in reply
+    # The graceful message is what gets persisted as the assistant turn.
+    assert memory.remembered[-1] == ("EpeerD", "assistant", reply)
+
+
+@pytest.mark.asyncio
+async def test_tools_disabled_uses_single_shot_chat_path():
+    """tools_enabled=false → registry path is skipped, byte-identical to before."""
+    handle = FakeHandle()
+    memory = FakeMemory()
+    registry = ToolRegistry([GetTimeTool()])
+    ollama = FakeOllama(reply="plain reply")
+    cfg = _tools_cfg(JEFF_TOOLS_ENABLED="false")
+
+    await handle_turn(handle, memory, ollama, cfg, "EpeerD", "hi", registry)
+
+    assert handle.sent == [("EpeerD", "plain reply")]
+    # The single-shot chat() path ran, not complete().
+    assert len(ollama.chat_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_uses_passed_system_prompt():
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="ok")
+    memory = FakeMemory()
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "ping", None, "SYSTEM-PROMPT-OVERRIDE"
+    )
+
+    history = ollama.chat_calls[0]
+    assert history[0] == {"role": "system", "content": "SYSTEM-PROMPT-OVERRIDE"}
 
 
 class _FakeEventsHandle:
