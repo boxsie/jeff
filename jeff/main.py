@@ -9,7 +9,7 @@ import signal
 import ensemble
 from psycopg_pool import AsyncConnectionPool
 
-from .commands import CommandContext, CommandRegistry, build_command_registry, parse_command
+from .commands import CommandContext, CommandRegistry, build_command_registry
 from .config import Config
 from .dispatch import DispatchPolicy, TurnDispatcher
 from .llm import ChatProvider, ChatResult
@@ -42,7 +42,6 @@ async def handle_turn(
     text: str,
     registry: ToolRegistry | None = None,
     system_prompt: str | None = None,
-    commands: CommandRegistry | None = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -55,9 +54,9 @@ async def handle_turn(
     composed once at startup; when omitted it falls back to `cfg.system_prompt`
     so existing callers/tests are unaffected.
 
-    When `commands` is provided and the text is a `/command`, it's handled
-    in-band and the turn returns immediately — the command and its reply are
-    control traffic and are NEVER stored in memory or sent to the model.
+    Commands no longer flow through here — the daemon parses them and delivers
+    `CommandInvocation` events handled by `_handle_command`, so this is a pure
+    chat turn.
 
     When `registry` has tools and tools are enabled, the reply is produced by
     the execute-and-loop (`_run_tool_loop`); otherwise the single-shot
@@ -66,30 +65,6 @@ async def handle_turn(
     tool calls/results are working state, not conversational turns, so they
     don't pollute recall.
     """
-    if commands is not None and cfg.commands_enabled:
-        parsed = parse_command(text, cfg.command_prefix)
-        if parsed is not None:
-            name, args = parsed
-            ctx = CommandContext(
-                handle=handle,
-                memory=memory,
-                cfg=cfg,
-                chat_provider=chat_provider,
-                peer=peer,
-                args=args,
-                registry=commands,
-            )
-            # dispatch() is safe-by-construction (unknown command / handler
-            # raise both become content-safe strings), so the only thing that
-            # can fail here is the send — wrapped on its own like the oversize
-            # path so a send fault can't escape the turn.
-            reply = await commands.dispatch(name, ctx)
-            try:
-                await handle.send_message(peer, reply)
-            except Exception:
-                log.exception("failed to send command reply to peer=%s", peer)
-            return
-
     try:
         await memory.remember(peer, "user", text)
         history = await build_history(
@@ -234,15 +209,13 @@ async def run(cfg: Config) -> None:
             # note. Built once, reused for every turn.
             system_prompt = compose_system_prompt(cfg.system_prompt, registry.names())
 
-            # In-band chat commands (intercepted before the LLM). Built once;
-            # log enabled names (mirror the tools/prompt-source startup lines).
-            commands = build_command_registry()
-            if cfg.commands_enabled and len(commands):
-                log.info(
-                    "commands enabled (prefix=%s): %s",
-                    cfg.command_prefix,
-                    ", ".join(commands.names()),
-                )
+            # Chat commands are declared to the daemon at registration and
+            # received as CommandInvocation events (the daemon owns parsing).
+            # Built once; log enabled names (mirror the tools/prompt-source
+            # startup lines). Disabled → declare nothing, receive nothing.
+            commands = build_command_registry() if cfg.commands_enabled else None
+            if commands is not None and len(commands):
+                log.info("commands enabled: %s", ", ".join(commands.names()))
             else:
                 log.info("commands disabled")
 
@@ -257,12 +230,17 @@ async def run(cfg: Config) -> None:
             if cfg.auth_seed_path:
                 client_kwargs["auth_seed"] = cfg.auth_seed_path
 
+            # Specs declared at registration so the daemon can route/aggregate
+            # them (and surface them in its unified /help). None → not declared.
+            command_specs = commands.to_ensemble_commands() if commands is not None else None
+
             async with ensemble.Client(**client_kwargs) as client:
                 handle = await client.register(
                     name=cfg.name,
                     acl=ensemble.ACL.ALLOWLIST,
                     allowlist=cfg.allowlist,
                     description=cfg.description,
+                    commands=command_specs,
                 )
                 async with handle:
                     log.info(
@@ -282,13 +260,12 @@ async def run(cfg: Config) -> None:
                             text,
                             registry,
                             system_prompt,
-                            commands,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
 
                     events_task = asyncio.create_task(
-                        _drain_events(handle, dispatcher, cfg),
+                        _drain_events(handle, dispatcher, cfg, memory, commands),
                         name="jeff-events",
                     )
                     stop_task = asyncio.create_task(stop.wait(), name="jeff-stop")
@@ -307,13 +284,57 @@ async def run(cfg: Config) -> None:
         await pool.close()
 
 
+async def _handle_command(
+    handle: ensemble.ServiceHandle,
+    memory: Memory,
+    cfg: Config,
+    commands: CommandRegistry,
+    inv: ensemble.CommandInvocation,
+) -> None:
+    """Run a daemon-routed command invocation and reply via the command channel.
+
+    `dispatch()` is safe-by-construction (unknown command / handler raise both
+    become content-safe strings), so the only thing that can fail here is the
+    reply send — wrapped on its own so a send fault can't escape the event loop.
+    The reply goes back as a CommandResult (not a chat message), so the daemon
+    can merge it with its own built-in leg under the augment model.
+    """
+    ctx = CommandContext(
+        handle=handle,
+        memory=memory,
+        cfg=cfg,
+        peer=inv.from_addr,
+        args=inv.args,
+    )
+    reply = await commands.dispatch(inv.name, ctx)
+    try:
+        await handle.send_command_result(inv.command_id, reply)
+    except Exception:
+        log.exception("failed to send command result to peer=%s", inv.from_addr)
+
+
 async def _drain_events(
     handle: ensemble.ServiceHandle,
     dispatcher: TurnDispatcher,
     cfg: Config,
+    memory: Memory | None = None,
+    commands: CommandRegistry | None = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
+        if isinstance(event, ensemble.CommandInvocation):
+            # The daemon already gates invocations by the service ACL; re-check
+            # the allowlist as defence-in-depth, mirroring the chat path.
+            if commands is None or memory is None:
+                continue
+            if event.from_addr not in allow:
+                log.info("ignoring command from non-allowlisted peer=%s", event.from_addr)
+                continue
+            # Commands are fast, deterministic, and never call the model, so they
+            # run inline rather than through the turn dispatcher (which rate-limits
+            # and serialises LLM turns).
+            await _handle_command(handle, memory, cfg, commands, event)
+            continue
         if not isinstance(event, ensemble.ChatMessage):
             continue
         peer = event.from_addr

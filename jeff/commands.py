@@ -1,17 +1,29 @@
-"""In-band chat commands — deterministic control messages, not LLM turns.
+"""Chat commands — deterministic control actions declared to the Ensemble daemon.
 
-The operator can type `/help`, `/new`, `/forget`, `/stats`, `/whoami` in chat.
-These are intercepted at the top of `main.handle_turn` *before* anything reaches
-memory or the model: a command and its reply are **control traffic** and are
-never stored (they'd pollute recall + the recent window) and never sent to the
-LLM. This is a different mechanism from the tool-use foundation — there the
-model decides to call a tool mid-turn; here the operator drives Jeff directly.
+Jeff **declares** its commands at registration (`ServiceHandle` via
+`register(commands=[...])`) and **receives** invocations as the daemon's
+`CommandInvocation` events — the daemon owns parsing and routing now, so there's
+no text-sniffing here. A command and its reply are control traffic: they never
+touch memory's recall window and never reach the model.
+
+The daemon supports **augment dispatch**: a command both it and Jeff handle runs
+*both* legs (the built-in always runs and can't be suppressed; Jeff only adds
+behaviour). That's why `/clear` works as one keystroke — the daemon's built-in
+clears the operator's local transcript while Jeff's `/clear` resets the working
+window of its memory. Jeff therefore declares only what it uniquely owns:
+
+  - `/clear`  — session reset: drop the active thread from the recent window,
+                keep long-term semantic memory (augments the daemon transcript-clear).
+  - `/forget` — hard wipe of everything Jeff remembers about this peer (confirm-gated).
+  - `/stats`  — memory counts, uptime, active provider/model, prompt source.
+
+`/help`/`/whoami` are ceded to the daemon's built-ins; the old soft `/new` is
+subsumed by the augmented `/clear`.
 
 `dispatch` is safe-by-construction, mirroring `tools.base.ToolRegistry`: a
 handler that raises becomes a short, content-safe apology rather than an
-exception that escapes into the turn loop (which would log + reply nothing).
-Single-user threat model (ACL = operator only) means there's no per-command
-permission split — only the operator ever reaches this code.
+exception that escapes the event loop. Single-user threat model (ACL = operator
+only) means there's no per-command permission split.
 """
 
 from __future__ import annotations
@@ -25,7 +37,6 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     import ensemble
 
     from .config import Config
-    from .llm import ChatProvider
     from .memory import Memory
 
 
@@ -41,20 +52,17 @@ _PROCESS_START = time.monotonic()
 class CommandContext:
     """Everything a command handler might need to act and to render a reply.
 
-    `args` is the text after the command name (stripped). `registry` is the
-    live registry so `/help` enumerates the real command set instead of a
-    hand-maintained list that could drift. `handle` isn't used by the starter
-    commands but is here for future commands that send their own traffic (e.g.
-    a `/backup` that offers a file over Ensemble).
+    `args` is the text after the command name (the daemon's `CommandInvocation`
+    already stripped the name + prefix). `peer` is the invoking address. `handle`
+    isn't used by the current commands but is here for future commands that send
+    their own traffic (e.g. a `/backup` that offers a file over Ensemble).
     """
 
     handle: "ensemble.ServiceHandle"
     memory: "Memory"
     cfg: "Config"
-    chat_provider: "ChatProvider"
     peer: str
     args: str
-    registry: "CommandRegistry"
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -62,38 +70,22 @@ CommandHandler = Callable[[CommandContext], Awaitable[str]]
 
 @dataclass(frozen=True)
 class Command:
-    """One registered command: its bare name (no prefix), help text, handler."""
+    """One declared command: bare name (no prefix), help text, arg hint, handler.
+
+    `name` must be slug-safe lowercase (the daemon matches case-insensitively and
+    rejects non-slug names). `description` is the one-line `/help` text; `usage`
+    is an optional arg hint (e.g. `"yes"`). `name`/`description`/`usage` are the
+    single source for the specs declared to the daemon (`to_ensemble_commands`).
+    """
 
     name: str
     description: str
     handler: CommandHandler
-
-
-def parse_command(text: str, prefix: str) -> tuple[str, str] | None:
-    """Split a message into `(name, args)` iff it is a command.
-
-    A message is a command exactly when (after leading whitespace) it starts
-    with `prefix`. The first whitespace-delimited token after the prefix is the
-    (case-folded) command name; the remainder, stripped, is the args. Returns
-    `None` for normal chat (no prefix) and for a bare prefix with no name — both
-    flow on to the normal turn untouched.
-    """
-    if not prefix:
-        return None
-    s = text.lstrip()
-    if not s.startswith(prefix):
-        return None
-    body = s[len(prefix):]
-    parts = body.split(None, 1)
-    if not parts or not parts[0]:
-        return None
-    name = parts[0].lower()
-    args = parts[1].strip() if len(parts) > 1 else ""
-    return name, args
+    usage: str = ""
 
 
 class CommandRegistry:
-    """Holds the active commands and dispatches to them safely."""
+    """Holds the active commands, declares them, and dispatches safely."""
 
     def __init__(self, commands: list[Command] | None = None):
         self._commands: dict[str, Command] = {}
@@ -116,19 +108,29 @@ class CommandRegistry:
     def get(self, name: str) -> Command | None:
         return self._commands.get(name)
 
+    def to_ensemble_commands(self) -> list["ensemble.Command"]:
+        """The specs Jeff declares at registration, single-sourced from the
+        registry so help text can't drift from behaviour."""
+        import ensemble  # hard dep of jeff; lazy to keep this module import-light
+
+        return [
+            ensemble.Command(name=c.name, description=c.description, usage=c.usage)
+            for c in (self._commands[n] for n in self.names())
+        ]
+
     async def dispatch(self, name: str, ctx: CommandContext) -> str:
         """Run command `name`; always return a content-safe reply string.
 
-        An unknown command yields a friendly hint (never passed to the model);
-        a handler that raises is logged (type only) and yields a generic
-        apology — never an exception string, which could carry endpoint/peer
-        detail (same discipline as the turn loop + tool dispatch).
+        The daemon only routes commands Jeff declared, so an unknown name here is
+        effectively unreachable — but it still yields a friendly hint rather than
+        an error. A handler that raises is logged (type only) and yields a generic
+        apology, never an exception string (which could carry endpoint/peer
+        detail — same discipline as the turn loop + tool dispatch).
         """
-        prefix = ctx.cfg.command_prefix
         cmd = self._commands.get(name)
         if cmd is None:
             log.info("unknown command=%s", name)
-            return f"Unknown command {prefix}{name} — try {prefix}help for the list."
+            return f"Unknown command /{name}."
         try:
             return await cmd.handler(ctx)
         except Exception:
@@ -136,13 +138,15 @@ class CommandRegistry:
             return "Sorry — that command hit a snag on my end. Try again in a moment."
 
 
-# --- starter command handlers ----------------------------------------------
+# --- command handlers ------------------------------------------------------
 
 
-async def _cmd_new(ctx: CommandContext) -> str:
-    """Soft reset: drop the active thread from the conversational window but
-    keep long-term semantic memory (older lines can still resurface via recall
-    if relevant to a future question)."""
+async def _cmd_clear(ctx: CommandContext) -> str:
+    """Session reset: drop the active thread from the conversational window but
+    keep long-term semantic memory (older lines can still resurface via recall).
+
+    This is the service leg of the daemon's `/clear` augment — the daemon clears
+    the operator's local transcript; this clears Jeff's working window."""
     await ctx.memory.set_history_cutoff(ctx.peer)
     return (
         "Started a fresh conversation — I've cleared this thread from my active "
@@ -154,31 +158,22 @@ async def _cmd_forget(ctx: CommandContext) -> str:
     """Hard wipe: irreversible DELETE of every stored message for this peer.
 
     Confirm-gated (`/forget yes`) on purpose — it's irreversible and a stray
-    `/forget` in chat is easy to fat-finger. The CLI `forget` subcommand stays
-    no-confirm (it's an explicit admin action); chat gets the guardrail.
+    `/forget` is easy to fat-finger. The CLI `forget` subcommand stays
+    no-confirm (it's an explicit admin action); chat gets the guardrail. Wipes
+    only Jeff's own memory — no attempt to reach any daemon transcript.
     """
     if ctx.args.strip().lower() != "yes":
         return (
             "⚠️ This permanently deletes everything I remember about our "
-            "conversations — there's no undo. If you're sure, send "
-            f"`{ctx.cfg.command_prefix}forget yes`."
+            "conversations — there's no undo. If you're sure, send `/forget yes`."
         )
     deleted = await ctx.memory.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
-async def _cmd_help(ctx: CommandContext) -> str:
-    prefix = ctx.cfg.command_prefix
-    lines = ["Here's what I can do on command:"]
-    for name in ctx.registry.names():
-        cmd = ctx.registry.get(name)
-        if cmd is not None:
-            lines.append(f"- `{prefix}{name}` — {cmd.description}")
-    return "\n".join(lines)
-
-
 async def _cmd_stats(ctx: CommandContext) -> str:
-    """Counts + uptime + active model. No DSN / key / seed / endpoint."""
+    """Counts + uptime + active provider/model + prompt source. No DSN / key /
+    seed / endpoint. Absorbs what the old `/whoami` reported."""
     mine = await ctx.memory.count(ctx.peer)
     total = await ctx.memory.total()
     uptime = _format_uptime(time.monotonic() - _PROCESS_START)
@@ -187,16 +182,6 @@ async def _cmd_stats(ctx: CommandContext) -> str:
         f"- stored messages (you): {mine}\n"
         f"- stored messages (all peers): {total}\n"
         f"- uptime: {uptime}\n"
-        f"- provider: {ctx.cfg.llm_provider}\n"
-        f"- model: {ctx.cfg.chat_model}"
-    )
-
-
-async def _cmd_whoami(ctx: CommandContext) -> str:
-    """Mirrors the startup log lines so the operator can confirm the live
-    config/build from chat. Provider/model/prompt-source only — no secrets."""
-    return (
-        "I'm Jeff.\n"
         f"- provider: {ctx.cfg.llm_provider}\n"
         f"- model: {ctx.cfg.chat_model}\n"
         f"- system prompt source: {ctx.cfg.system_prompt_source}"
@@ -221,26 +206,21 @@ def _format_uptime(seconds: float) -> str:
 
 
 def build_command_registry() -> CommandRegistry:
-    """The default command set wired into production (see main.run)."""
+    """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
+    daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`."""
     return CommandRegistry(
         [
             Command(
-                "new",
+                "clear",
                 "start a fresh conversation (keeps long-term memory)",
-                _cmd_new,
+                _cmd_clear,
             ),
-            Command("clear", "alias for /new", _cmd_new),
             Command(
                 "forget",
-                "permanently wipe everything I remember (needs /forget yes)",
+                "permanently wipe everything I remember",
                 _cmd_forget,
+                usage="yes",
             ),
-            Command("help", "list these commands", _cmd_help),
             Command("stats", "memory counts, uptime, and active model", _cmd_stats),
-            Command(
-                "whoami",
-                "show my active provider, model, and prompt source",
-                _cmd_whoami,
-            ),
         ]
     )
