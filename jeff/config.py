@@ -100,6 +100,26 @@ def _parse_embed_dim(raw: str) -> int:
     return n
 
 
+# SearXNG safesearch levels: 0 = off, 1 = moderate, 2 = strict. Jeff defaults
+# to off (the operator wants to search for anything); operator-controlled, so a
+# bad value fails fast at load rather than being silently coerced.
+_SAFESEARCH_LEVELS = frozenset({0, 1, 2})
+
+
+def _parse_safesearch(raw: str) -> int:
+    try:
+        n = int(raw)
+    except ValueError as e:
+        raise ConfigError(
+            f"JEFF_SEARCH_SAFESEARCH must be 0, 1, or 2; got {raw!r}"
+        ) from e
+    if n not in _SAFESEARCH_LEVELS:
+        raise ConfigError(
+            f"JEFF_SEARCH_SAFESEARCH must be 0 (off), 1 (moderate), or 2 (strict); got {n}"
+        )
+    return n
+
+
 def _parse_bool(raw: str | None) -> bool:
     """Parse a permissive boolean env value. Anything truthy-looking is True."""
     if raw is None:
@@ -146,6 +166,7 @@ class Config:
     search_enabled: bool
     searxng_url: str
     searxng_auth: str | None
+    search_safesearch: int
 
     max_inflight: int
     per_peer_concurrency: int
@@ -225,6 +246,7 @@ class Config:
             search_enabled=search_enabled,
             searxng_url=searxng_url,
             searxng_auth=e.get("JEFF_SEARXNG_AUTH") or None,
+            search_safesearch=_parse_safesearch(e.get("JEFF_SEARCH_SAFESEARCH", "0")),
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),

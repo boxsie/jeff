@@ -187,6 +187,7 @@ async def run(cfg: Config) -> None:
                 cfg.searxng_url,
                 auth=cfg.searxng_auth,
                 max_resp_bytes=cfg.ollama_max_resp_bytes,
+                safesearch=cfg.search_safesearch,
             ) as searxng,
         ):
             log.info("chat provider=%s model=%s", cfg.llm_provider, cfg.chat_model)

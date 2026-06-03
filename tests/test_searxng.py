@@ -73,6 +73,43 @@ async def test_search_builds_json_general_query_and_parses_web():
 
 
 @pytest.mark.asyncio
+async def test_search_defaults_safesearch_off():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(200, json=_WEB_BODY)
+
+    # No safesearch arg → client default (off) rides on the request.
+    client = _client(handler)
+    try:
+        await client.search("python")
+    finally:
+        await client.aclose()
+    assert seen["params"]["safesearch"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_search_safesearch_client_default_and_call_override():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(200, json=_WEB_BODY)
+
+    # Client constructed with strict default…
+    client = _client(handler, safesearch=2)
+    try:
+        await client.search("python")
+        assert seen["params"]["safesearch"] == "2"
+        # …but an explicit per-call level wins.
+        await client.search("python", safesearch=0)
+        assert seen["params"]["safesearch"] == "0"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_search_images_category():
     seen = {}
 

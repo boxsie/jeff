@@ -239,6 +239,25 @@ def test_search_defaults_off_with_localhost_url():
     assert cfg.searxng_auth is None
 
 
+def test_safesearch_defaults_off():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.search_safesearch == 0
+
+
+def test_safesearch_override_parsed():
+    cfg = Config.from_env(
+        {"JEFF_DB_URL": "postgresql://x", "JEFF_SEARCH_SAFESEARCH": "2"}
+    )
+    assert cfg.search_safesearch == 2
+
+
+def test_safesearch_rejects_out_of_range_and_non_integer():
+    with pytest.raises(ConfigError, match="JEFF_SEARCH_SAFESEARCH"):
+        Config.from_env({"JEFF_DB_URL": "postgresql://x", "JEFF_SEARCH_SAFESEARCH": "3"})
+    with pytest.raises(ConfigError, match="JEFF_SEARCH_SAFESEARCH"):
+        Config.from_env({"JEFF_DB_URL": "postgresql://x", "JEFF_SEARCH_SAFESEARCH": "x"})
+
+
 def test_search_url_and_auth_parsed():
     cfg = Config.from_env(
         {
