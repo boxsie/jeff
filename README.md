@@ -78,26 +78,30 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_SEARXNG_URL` | `http://localhost:8888` | SearXNG JSON-API base URL. The real in-cluster URL is **not committed** — it arrives via the serves ConfigMap. Startup fails fast if search is enabled but this is empty. |
 | `JEFF_SEARXNG_AUTH` | _none_ | Optional full `Authorization` header value if the SearXNG instance requires auth (e.g. `Basic …` / `Bearer …`). Never logged. |
 | `JEFF_SEARCH_SAFESEARCH` | `0` | Safe-search level stamped on every query: `0` off, `1` moderate, `2` strict. Off by default. A bad value fails fast at load. |
-| `JEFF_COMMANDS_ENABLED` | `true` | Master switch for in-band chat commands (`/help`, `/new`, …). When off, a `/`-prefixed message is treated as ordinary chat. |
-| `JEFF_COMMAND_PREFIX` | `/` | Prefix that marks a message as a command rather than a turn. A blank value fails fast at load. |
+| `JEFF_COMMANDS_ENABLED` | `true` | Whether Jeff declares its slash-commands (`/clear`, `/forget`, `/stats`) to the daemon at registration. When off, Jeff declares none and the daemon routes no command invocations to it. |
 
 ## Commands
 
-When `JEFF_COMMANDS_ENABLED` is on, a message that starts with the command
-prefix (default `/`) is **intercepted before the LLM** and handled directly —
-deterministic operator control, distinct from LLM-invoked tools. The command and
-its reply are control traffic: they are **never stored in memory** (so they don't
-pollute recall or the recent window) and **never sent to the model**. An unknown
-`/foo` gets a friendly "try `/help`" reply rather than going to the LLM; a handler
-that fails returns a safe apology, never exception text.
+Slash-commands are **owned by the Ensemble daemon**, not parsed out of chat text.
+At registration Jeff *declares* the commands it handles; the daemon parses
+`/command` input, routes invocations to Jeff as control events, and merges Jeff's
+reply with its own built-ins. A command and its reply are control traffic: they
+**never touch memory** (so they don't pollute recall or the recent window) and
+**never reach the model**. A handler that fails returns a safe apology, never
+exception text.
+
+The daemon uses **augment dispatch** — a command both it and Jeff handle runs
+*both* legs. So `/clear` is one keystroke with two effects: the daemon's built-in
+clears your local transcript while Jeff's leg resets its working memory window.
 
 | Command | Effect |
 | --- | --- |
-| `/new` (alias `/clear`) | **Soft reset** — starts a fresh conversation thread (clears the recent window) while keeping long-term semantic memory, so older facts can still resurface via recall if relevant. |
-| `/forget` | **Hard wipe** — permanently deletes every stored message for you. Irreversible, so it's confirm-gated: send `/forget yes` to actually wipe. |
-| `/help` | Lists the registered commands and one-line descriptions (generated from the live registry, so it can't drift). |
-| `/stats` | Stored-message counts (you + all peers), process uptime, and the active provider/model. No secrets. |
-| `/whoami` | Active chat provider, model, and system-prompt source (file / env / default) — mirrors the startup log lines. No secrets. |
+| `/clear` | **Session reset** — drops the active thread from Jeff's recent window while keeping long-term semantic memory (older facts can still resurface via recall). Augments the daemon's built-in transcript clear. |
+| `/forget` | **Hard wipe** — permanently deletes every stored message for you. Irreversible, so it's confirm-gated: send `/forget yes` to actually wipe. Jeff-only; no daemon counterpart. |
+| `/stats` | Stored-message counts (you + all peers), process uptime, active provider/model, and system-prompt source. No secrets. |
+
+`/help` and `/whoami` are the daemon's built-ins (it aggregates every service's
+commands and reports node identity) — Jeff no longer declares them.
 
 ## Tools
 

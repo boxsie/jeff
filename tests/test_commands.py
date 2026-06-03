@@ -1,8 +1,9 @@
-"""Chat command framework: parsing, safe dispatch, and the starter commands.
+"""Declared commands: safe dispatch, the handler set, and the daemon specs.
 
 No DB here — `Memory` is faked so these run without Docker. The soft/hard
 memory semantics (the `peer_state` watermark) are covered against real Postgres
-in tests/test_memory.py.
+in tests/test_memory.py. Parsing/routing is the daemon's job now (ensemble), so
+there's nothing to test on that front here.
 """
 
 from __future__ import annotations
@@ -14,17 +15,16 @@ from jeff.commands import (
     CommandContext,
     CommandRegistry,
     build_command_registry,
-    parse_command,
 )
 from jeff.config import Config
 
 
 class FakeHandle:
     def __init__(self):
-        self.sent: list[tuple[str, str]] = []
+        self.results: list[tuple[str, str]] = []
 
-    async def send_message(self, to_addr: str, text: str) -> None:
-        self.sent.append((to_addr, text))
+    async def send_command_result(self, command_id: str, text: str, ok: bool = True) -> None:
+        self.results.append((command_id, text))
 
 
 class FakeMemory:
@@ -53,16 +53,6 @@ class FakeMemory:
         raise AssertionError("commands must not write to memory")
 
 
-class ExplodingProvider:
-    """Any provider call from the command path is a bug."""
-
-    async def chat(self, *a, **k):  # pragma: no cover
-        raise AssertionError("commands must not call the chat provider")
-
-    async def complete(self, *a, **k):  # pragma: no cover
-        raise AssertionError("commands must not call the chat provider")
-
-
 def _cfg(**extra) -> Config:
     env = {
         "JEFF_DB_URL": "postgresql://jeff:pwd@db.internal:5432/jeff",
@@ -73,57 +63,38 @@ def _cfg(**extra) -> Config:
     return Config.from_env(env)
 
 
-def _ctx(memory=None, args="", registry=None, cfg=None) -> CommandContext:
-    registry = registry if registry is not None else build_command_registry()
+def _ctx(memory=None, args="", cfg=None) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
         memory=memory or FakeMemory(),
         cfg=cfg or _cfg(),
-        chat_provider=ExplodingProvider(),
         peer="EpeerD",
         args=args,
-        registry=registry,
     )
 
 
-# --- parsing ---------------------------------------------------------------
+# --- the declared set ------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "text,expected",
-    [
-        ("/help", ("help", "")),
-        ("/new", ("new", "")),
-        ("/forget", ("forget", "")),
-        ("/forget yes", ("forget", "yes")),
-        ("/stats", ("stats", "")),
-        ("/whoami", ("whoami", "")),
-        ("/HELP", ("help", "")),  # name is case-folded
-        ("  /help  ", ("help", "")),  # leading whitespace tolerated
-        ("/echo a b c", ("echo", "a b c")),  # args are the stripped remainder
-    ],
-)
-def test_parse_recognises_commands(text, expected):
-    assert parse_command(text, "/") == expected
+def test_registry_declares_exactly_clear_forget_stats():
+    reg = build_command_registry()
+    assert reg.names() == ["clear", "forget", "stats"]
+    # The retired commands are gone — the daemon owns /help and /whoami, and the
+    # old soft /new is subsumed by the augmented /clear.
+    for gone in ("new", "help", "whoami"):
+        assert reg.get(gone) is None
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "hello there",  # plain chat
-        "what is /etc for?",  # slash not at the start
-        "/",  # bare prefix, no name
-        "/   ",  # prefix + whitespace only
-        "",
-    ],
-)
-def test_parse_passes_normal_text_through(text):
-    assert parse_command(text, "/") is None
+def test_to_ensemble_commands_specs_are_single_sourced():
+    import ensemble
 
-
-def test_parse_honours_custom_prefix():
-    assert parse_command("!ping now", "!") == ("ping", "now")
-    assert parse_command("/ping", "!") is None
+    specs = build_command_registry().to_ensemble_commands()
+    assert [s.name for s in specs] == ["clear", "forget", "stats"]
+    assert all(isinstance(s, ensemble.Command) for s in specs)
+    # Description + usage flow straight from the registry (can't drift).
+    forget = next(s for s in specs if s.name == "forget")
+    assert forget.usage == "yes"
+    assert "wipe" in forget.description.lower()
 
 
 # --- dispatch safety -------------------------------------------------------
@@ -133,7 +104,6 @@ def test_parse_honours_custom_prefix():
 async def test_unknown_command_returns_hint_not_exception():
     reply = await build_command_registry().dispatch("nope", _ctx())
     assert reply.startswith("Unknown command /nope")
-    assert "/help" in reply
 
 
 @pytest.mark.asyncio
@@ -142,27 +112,20 @@ async def test_handler_that_raises_yields_safe_apology():
         raise RuntimeError("DSN=postgresql://secret leaked")
 
     reg = CommandRegistry([Command("boom", "explodes", boom)])
-    reply = await reg.dispatch("boom", _ctx(registry=reg))
+    reply = await reg.dispatch("boom", _ctx())
     assert "snag" in reply.lower()
     assert "DSN" not in reply and "secret" not in reply
 
 
-# --- starter commands ------------------------------------------------------
+# --- the handlers ----------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_new_sets_cutoff_and_keeps_long_term_memory_in_copy():
+async def test_clear_sets_cutoff_and_keeps_long_term_memory():
     mem = FakeMemory()
-    reply = await build_command_registry().dispatch("new", _ctx(memory=mem))
+    reply = await build_command_registry().dispatch("clear", _ctx(memory=mem))
     assert mem.cutoffs == ["EpeerD"]
     assert "fresh conversation" in reply.lower()
-
-
-@pytest.mark.asyncio
-async def test_clear_is_an_alias_for_new():
-    mem = FakeMemory()
-    await build_command_registry().dispatch("clear", _ctx(memory=mem))
-    assert mem.cutoffs == ["EpeerD"]
 
 
 @pytest.mark.asyncio
@@ -183,32 +146,15 @@ async def test_forget_yes_wipes_and_reports_count():
 
 
 @pytest.mark.asyncio
-async def test_help_lists_every_registered_command():
-    reg = build_command_registry()
-    reply = await reg.dispatch("help", _ctx(registry=reg))
-    for name in reg.names():
-        assert f"/{name}" in reply
-    # Descriptions come straight from the registry (can't drift).
-    assert reg.get("stats").description in reply
-
-
-@pytest.mark.asyncio
-async def test_stats_has_counts_and_model_and_no_secrets():
+async def test_stats_has_counts_model_prompt_source_and_no_secrets():
     cfg = _cfg()
     reply = await build_command_registry().dispatch("stats", _ctx(cfg=cfg))
     assert "3" in reply  # this peer's count
     assert "7" in reply  # total
     assert "uptime" in reply.lower()
-    assert cfg.chat_model in reply
-    _assert_no_secrets(reply, cfg)
-
-
-@pytest.mark.asyncio
-async def test_whoami_reports_provider_model_prompt_source_no_secrets():
-    cfg = _cfg()
-    reply = await build_command_registry().dispatch("whoami", _ctx(cfg=cfg))
     assert cfg.llm_provider in reply
     assert cfg.chat_model in reply
+    # /stats absorbed what /whoami used to report.
     assert cfg.system_prompt_source in reply
     _assert_no_secrets(reply, cfg)
 

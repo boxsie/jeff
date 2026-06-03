@@ -234,14 +234,19 @@ async def test_handle_turn_uses_passed_system_prompt():
 
 
 class FakeCommandMemory(FakeMemory):
-    """FakeMemory plus the command-path methods, recording cutoff calls."""
+    """FakeMemory plus the command-path methods, recording cutoff/forget calls."""
 
     def __init__(self):
         super().__init__()
         self.cutoffs: list[str] = []
+        self.forgotten: list[str] = []
 
     async def set_history_cutoff(self, peer):
         self.cutoffs.append(peer)
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return 4
 
     async def count(self, peer):
         return len(self.remembered)
@@ -250,92 +255,13 @@ class FakeCommandMemory(FakeMemory):
         return len(self.remembered)
 
 
-@pytest.mark.asyncio
-async def test_handle_turn_intercepts_command_no_memory_no_llm():
-    """A /command is handled in-band: reply sent once, nothing stored, model
-    never called."""
-    from jeff.commands import build_command_registry
-
-    handle = FakeHandle()
-    memory = FakeCommandMemory()
-    ollama = FakeOllama(reply="should not be used")
-    cfg = _cfg()
-
-    await handle_turn(
-        handle, memory, ollama, cfg, "EpeerD", "/new", None, None, build_command_registry()
-    )
-
-    # The soft-reset ran, exactly one reply went out, and the model was never
-    # consulted — nor was the command stored as a conversational turn.
-    assert memory.cutoffs == ["EpeerD"]
-    assert len(handle.sent) == 1 and handle.sent[0][0] == "EpeerD"
-    assert ollama.chat_calls == []
-    assert memory.remembered == []
-
-
-@pytest.mark.asyncio
-async def test_handle_turn_unknown_command_does_not_reach_llm():
-    from jeff.commands import build_command_registry
-
-    handle = FakeHandle()
-    memory = FakeCommandMemory()
-    ollama = FakeOllama(reply="should not be used")
-    cfg = _cfg()
-
-    await handle_turn(
-        handle, memory, ollama, cfg, "EpeerD", "/bogus", None, None, build_command_registry()
-    )
-
-    assert ollama.chat_calls == []
-    assert memory.remembered == []
-    assert len(handle.sent) == 1
-    assert "Unknown command" in handle.sent[0][1]
-
-
-@pytest.mark.asyncio
-async def test_handle_turn_normal_text_with_commands_still_runs_turn():
-    """Non-/ text falls through to the normal turn even when commands are wired."""
-    from jeff.commands import build_command_registry
-
-    handle = FakeHandle()
-    memory = FakeCommandMemory()
-    ollama = FakeOllama(reply="hi there")
-    cfg = _cfg()
-
-    await handle_turn(
-        handle, memory, ollama, cfg, "EpeerD", "hello", None, None, build_command_registry()
-    )
-
-    assert handle.sent == [("EpeerD", "hi there")]
-    assert len(ollama.chat_calls) == 1
-    assert ("EpeerD", "user", "hello") in memory.remembered
-
-
-@pytest.mark.asyncio
-async def test_handle_turn_commands_disabled_treats_slash_as_normal_text():
-    from jeff.commands import build_command_registry
-
-    handle = FakeHandle()
-    memory = FakeCommandMemory()
-    ollama = FakeOllama(reply="llm reply")
-    cfg = _tools_cfg(JEFF_COMMANDS_ENABLED="false")
-
-    await handle_turn(
-        handle, memory, ollama, cfg, "EpeerD", "/new", None, None, build_command_registry()
-    )
-
-    # Commands off → "/new" is just text: it hits the LLM and is remembered.
-    assert memory.cutoffs == []
-    assert len(ollama.chat_calls) == 1
-    assert ("EpeerD", "user", "/new") in memory.remembered
-
-
 class _FakeEventsHandle:
     """Minimal ServiceHandle-like object for driving `_drain_events` in tests."""
 
     def __init__(self, events: list):
         self._events = events
         self.sent: list[tuple[str, str]] = []
+        self.results: list[tuple[str, str]] = []
 
     async def events(self):
         for ev in self._events:
@@ -343,6 +269,92 @@ class _FakeEventsHandle:
 
     async def send_message(self, to_addr: str, text: str) -> None:
         self.sent.append((to_addr, text))
+
+    async def send_command_result(self, command_id: str, text: str, ok: bool = True) -> None:
+        self.results.append((command_id, text))
+
+
+def _commands_cfg(**extra) -> Config:
+    env = {"JEFF_DB_URL": "postgresql://unused", "JEFF_ALLOWLIST": "EpeerD"}
+    env.update(extra)
+    return Config.from_env(env)
+
+
+def _invocation(name: str, args: str = "", *, peer: str = "EpeerD", cid: str = "c1"):
+    return ensemble.CommandInvocation(
+        type="command", command_id=cid, from_addr=peer, name=name, args=args
+    )
+
+
+async def _drain_commands(events: list, memory) -> _FakeEventsHandle:
+    """Drive `_drain_events` over a fixed event list with commands wired."""
+    from jeff.commands import build_command_registry
+
+    handle = _FakeEventsHandle(events)
+    dispatcher = TurnDispatcher(
+        lambda peer, text: _noop(), DispatchPolicy(max_inflight=10, peer_rate_burst=10)
+    )
+    await _drain_events(handle, dispatcher, _commands_cfg(), memory, build_command_registry())
+    await dispatcher.drain()
+    return handle
+
+
+async def _noop() -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_command_invocation_clear_resets_and_replies_on_command_channel():
+    """A /clear invocation runs the session reset and replies via the command
+    channel (a CommandResult), NOT as a chat message — and stores nothing."""
+    memory = FakeCommandMemory()
+    handle = await _drain_commands([_invocation("clear")], memory)
+
+    assert memory.cutoffs == ["EpeerD"]
+    assert len(handle.results) == 1
+    cid, text = handle.results[0]
+    assert cid == "c1" and "fresh conversation" in text.lower()
+    # Reply went on the command channel, not the chat channel; nothing stored.
+    assert handle.sent == []
+    assert memory.remembered == []
+
+
+@pytest.mark.asyncio
+async def test_command_invocation_forget_yes_wipes_only_jeff_memory():
+    """/forget yes wipes Jeff's memory and makes no attempt at a daemon transcript."""
+    memory = FakeCommandMemory()
+    handle = await _drain_commands([_invocation("forget", "yes")], memory)
+
+    assert memory.forgotten == ["EpeerD"]
+    assert len(handle.results) == 1 and "clean slate" in handle.results[0][1].lower()
+    # No chat-channel traffic at all (no cross-channel reach).
+    assert handle.sent == []
+
+
+@pytest.mark.asyncio
+async def test_command_invocation_from_non_allowlisted_peer_is_ignored():
+    memory = FakeCommandMemory()
+    handle = await _drain_commands([_invocation("clear", peer="Estranger")], memory)
+
+    assert memory.cutoffs == []
+    assert handle.results == []
+
+
+@pytest.mark.asyncio
+async def test_command_invocation_handler_raise_replies_safely():
+    """A handler that raises still replies (content-safe), never escapes the loop."""
+
+    class BoomMemory(FakeCommandMemory):
+        async def set_history_cutoff(self, peer):
+            raise RuntimeError("DSN=postgresql://secret leaked")
+
+    memory = BoomMemory()
+    handle = await _drain_commands([_invocation("clear")], memory)
+
+    assert len(handle.results) == 1
+    _, text = handle.results[0]
+    assert "snag" in text.lower()
+    assert "secret" not in text and "DSN" not in text
 
 
 @pytest.mark.asyncio

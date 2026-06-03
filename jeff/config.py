@@ -169,7 +169,6 @@ class Config:
     search_safesearch: int
 
     commands_enabled: bool
-    command_prefix: str
 
     max_inflight: int
     per_peer_concurrency: int
@@ -225,14 +224,6 @@ class Config:
         if search_enabled and not searxng_url:
             raise ConfigError("JEFF_SEARCH_ENABLED is on but JEFF_SEARXNG_URL is empty")
 
-        # In-band chat commands (jeff ticket dc1791d5). The prefix marks a
-        # message as a control command rather than a turn; it's operator-
-        # controlled, so a blank value fails fast rather than turning every
-        # message into a "command".
-        command_prefix = e.get("JEFF_COMMAND_PREFIX", "/").strip()
-        if not command_prefix:
-            raise ConfigError("JEFF_COMMAND_PREFIX must not be empty")
-
         return Config(
             name=e.get("JEFF_NAME", "jeff"),
             description=e.get("JEFF_DESCRIPTION", "Personal AI assistant"),
@@ -259,7 +250,6 @@ class Config:
             searxng_auth=e.get("JEFF_SEARXNG_AUTH") or None,
             search_safesearch=_parse_safesearch(e.get("JEFF_SEARCH_SAFESEARCH", "0")),
             commands_enabled=_parse_bool(e.get("JEFF_COMMANDS_ENABLED", "true")),
-            command_prefix=command_prefix,
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),
