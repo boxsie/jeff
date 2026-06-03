@@ -53,6 +53,7 @@ class SearxngClient:
         auth: str | None = None,
         timeout: float = 30.0,
         max_resp_bytes: int = DEFAULT_MAX_RESP_BYTES,
+        safesearch: int = 0,
     ):
         headers: dict[str, str] = {}
         if auth:
@@ -67,6 +68,10 @@ class SearxngClient:
             headers=headers,
         )
         self._max_resp_bytes = max_resp_bytes
+        # Default safesearch level applied to every query unless a call overrides
+        # it. 0 = off (the operator wants unfiltered search), 1 = moderate,
+        # 2 = strict. Wired from JEFF_SEARCH_SAFESEARCH via config.
+        self._safesearch = safesearch
 
     async def search(
         self,
@@ -74,20 +79,22 @@ class SearxngClient:
         *,
         categories: str = "general",
         max_results: int = DEFAULT_RESULTS,
-        safesearch: int = 1,
+        safesearch: int | None = None,
     ) -> list[dict]:
         """GET /search?format=json. Returns the parsed `results[]`, bounded.
 
         `categories` is "general" for web search, "images" for image search.
-        Raises `SearxngError` on any failure; the calling tool turns that into a
-        safe string for the model.
+        `safesearch` defaults to the client-wide level (`JEFF_SEARCH_SAFESEARCH`,
+        off by default) when not given. Raises `SearxngError` on any failure; the
+        calling tool turns that into a safe string for the model.
         """
         n = max(1, min(int(max_results), MAX_RESULTS_CAP))
+        level = self._safesearch if safesearch is None else safesearch
         params = {
             "q": query,
             "format": "json",
             "categories": categories,
-            "safesearch": safesearch,
+            "safesearch": level,
         }
         try:
             async with self._client.stream("GET", "/search", params=params) as resp:

@@ -77,6 +77,7 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_SEARCH_ENABLED` | `false` | Enable the SearXNG-backed `web_search` / `image_search` tools (also requires `JEFF_TOOLS_ENABLED`). |
 | `JEFF_SEARXNG_URL` | `http://localhost:8888` | SearXNG JSON-API base URL. The real in-cluster URL is **not committed** — it arrives via the serves ConfigMap. Startup fails fast if search is enabled but this is empty. |
 | `JEFF_SEARXNG_AUTH` | _none_ | Optional full `Authorization` header value if the SearXNG instance requires auth (e.g. `Basic …` / `Bearer …`). Never logged. |
+| `JEFF_SEARCH_SAFESEARCH` | `0` | Safe-search level stamped on every query: `0` off, `1` moderate, `2` strict. Off by default. A bad value fails fast at load. |
 
 ## Tools
 
