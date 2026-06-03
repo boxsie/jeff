@@ -67,6 +67,18 @@ _DDL_IDX_EMBEDDING = sql.SQL(
     "ON messages USING hnsw (embedding vector_cosine_ops)"
 )
 
+# Per-peer control state. `history_cutoff` is the soft-reset watermark for the
+# `/new` chat command (jeff ticket dc1791d5): `recent()` only returns rows
+# newer than it, so the active conversational window starts fresh, while
+# `recall()` deliberately ignores it — long-term semantic memory still spans
+# everything. No embedding here, so it's a plain CREATE TABLE (no env-derived
+# dimension), but kept in the same idempotent psycopg.sql shape as the rest.
+_DDL_PEER_STATE = sql.SQL(
+    "CREATE TABLE IF NOT EXISTS peer_state ("
+    "peer TEXT PRIMARY KEY, "
+    "history_cutoff TIMESTAMPTZ)"
+)
+
 
 class Memory:
     """Async memory store backed by Postgres + pgvector."""
@@ -114,6 +126,7 @@ class Memory:
                 await cur.execute(table_ddl)
                 await cur.execute(_DDL_IDX_PEER_TS)
                 await cur.execute(_DDL_IDX_EMBEDDING)
+                await cur.execute(_DDL_PEER_STATE)
             await conn.commit()
             await register_vector_async(conn)
 
@@ -203,14 +216,22 @@ class Memory:
         ]
 
     async def recent(self, peer: str, n: int = 10) -> list[Message]:
+        # Respect the soft-reset watermark: after `/new` (set_history_cutoff),
+        # the conversational window only includes rows newer than the cutoff.
+        # COALESCE to -infinity when no cutoff is set so the unfiltered case is
+        # identical to before. recall() is deliberately NOT filtered this way —
+        # long-term semantic memory still spans everything.
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT id, peer, role, content, ts FROM messages "
                     "WHERE peer = %s "
+                    "  AND ts > COALESCE("
+                    "    (SELECT history_cutoff FROM peer_state WHERE peer = %s), "
+                    "    '-infinity'::timestamptz) "
                     "ORDER BY ts DESC "
                     "LIMIT %s",
-                    (peer, n),
+                    (peer, peer, n),
                 )
                 rows = await cur.fetchall()
         # Return chronological (oldest first) so callers can append to chat history directly.
@@ -242,5 +263,48 @@ class Memory:
                     (peer,),
                 )
                 deleted = cur.rowcount
+                # Clear any soft-reset watermark too — a stale cutoff over an
+                # empty history is harmless but tidy, and keeps peer_state from
+                # leaking rows for peers whose messages are all gone.
+                await cur.execute(
+                    "DELETE FROM peer_state WHERE peer = %s",
+                    (peer,),
+                )
             await conn.commit()
         return int(deleted)
+
+    async def set_history_cutoff(self, peer: str) -> None:
+        """Soft reset for `/new`: mark now() as this peer's history watermark.
+
+        Upsert so repeated `/new`s just advance the cutoff. `recent()` honours
+        it (fresh conversational window); `recall()` ignores it (long-term
+        semantic memory is unaffected).
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO peer_state (peer, history_cutoff) "
+                    "VALUES (%s, now()) "
+                    "ON CONFLICT (peer) DO UPDATE SET history_cutoff = now()",
+                    (peer,),
+                )
+            await conn.commit()
+
+    async def count(self, peer: str) -> int:
+        """How many stored messages this peer has (for `/stats`)."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT count(*) FROM messages WHERE peer = %s",
+                    (peer,),
+                )
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+    async def total(self) -> int:
+        """Total stored messages across all peers (for `/stats`)."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT count(*) FROM messages")
+                row = await cur.fetchone()
+        return int(row[0]) if row else 0

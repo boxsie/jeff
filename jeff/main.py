@@ -9,6 +9,7 @@ import signal
 import ensemble
 from psycopg_pool import AsyncConnectionPool
 
+from .commands import CommandContext, CommandRegistry, build_command_registry, parse_command
 from .config import Config
 from .dispatch import DispatchPolicy, TurnDispatcher
 from .llm import ChatProvider, ChatResult
@@ -41,6 +42,7 @@ async def handle_turn(
     text: str,
     registry: ToolRegistry | None = None,
     system_prompt: str | None = None,
+    commands: CommandRegistry | None = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -53,6 +55,10 @@ async def handle_turn(
     composed once at startup; when omitted it falls back to `cfg.system_prompt`
     so existing callers/tests are unaffected.
 
+    When `commands` is provided and the text is a `/command`, it's handled
+    in-band and the turn returns immediately — the command and its reply are
+    control traffic and are NEVER stored in memory or sent to the model.
+
     When `registry` has tools and tools are enabled, the reply is produced by
     the execute-and-loop (`_run_tool_loop`); otherwise the single-shot
     `chat()` path runs, byte-identical to the pre-tool behaviour. Either way
@@ -60,6 +66,30 @@ async def handle_turn(
     tool calls/results are working state, not conversational turns, so they
     don't pollute recall.
     """
+    if commands is not None and cfg.commands_enabled:
+        parsed = parse_command(text, cfg.command_prefix)
+        if parsed is not None:
+            name, args = parsed
+            ctx = CommandContext(
+                handle=handle,
+                memory=memory,
+                cfg=cfg,
+                chat_provider=chat_provider,
+                peer=peer,
+                args=args,
+                registry=commands,
+            )
+            # dispatch() is safe-by-construction (unknown command / handler
+            # raise both become content-safe strings), so the only thing that
+            # can fail here is the send — wrapped on its own like the oversize
+            # path so a send fault can't escape the turn.
+            reply = await commands.dispatch(name, ctx)
+            try:
+                await handle.send_message(peer, reply)
+            except Exception:
+                log.exception("failed to send command reply to peer=%s", peer)
+            return
+
     try:
         await memory.remember(peer, "user", text)
         history = await build_history(
@@ -203,6 +233,19 @@ async def run(cfg: Config) -> None:
             # and Markdown rendering. Tools off → addendum is just the formatting
             # note. Built once, reused for every turn.
             system_prompt = compose_system_prompt(cfg.system_prompt, registry.names())
+
+            # In-band chat commands (intercepted before the LLM). Built once;
+            # log enabled names (mirror the tools/prompt-source startup lines).
+            commands = build_command_registry()
+            if cfg.commands_enabled and len(commands):
+                log.info(
+                    "commands enabled (prefix=%s): %s",
+                    cfg.command_prefix,
+                    ", ".join(commands.names()),
+                )
+            else:
+                log.info("commands disabled")
+
             memory = await Memory.create(
                 pool,
                 embed_client,
@@ -239,6 +282,7 @@ async def run(cfg: Config) -> None:
                             text,
                             registry,
                             system_prompt,
+                            commands,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))

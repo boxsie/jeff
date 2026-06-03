@@ -258,6 +258,29 @@ def test_safesearch_rejects_out_of_range_and_non_integer():
         Config.from_env({"JEFF_DB_URL": "postgresql://x", "JEFF_SEARCH_SAFESEARCH": "x"})
 
 
+def test_commands_defaults():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.commands_enabled is True
+    assert cfg.command_prefix == "/"
+
+
+def test_commands_can_be_disabled_and_prefix_overridden():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_COMMANDS_ENABLED": "false",
+            "JEFF_COMMAND_PREFIX": "!",
+        }
+    )
+    assert cfg.commands_enabled is False
+    assert cfg.command_prefix == "!"
+
+
+def test_blank_command_prefix_fails_fast():
+    with pytest.raises(ConfigError, match="JEFF_COMMAND_PREFIX"):
+        Config.from_env({"JEFF_DB_URL": "postgresql://x", "JEFF_COMMAND_PREFIX": "   "})
+
+
 def test_search_url_and_auth_parsed():
     cfg = Config.from_env(
         {

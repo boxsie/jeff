@@ -233,6 +233,103 @@ async def test_handle_turn_uses_passed_system_prompt():
     assert history[0] == {"role": "system", "content": "SYSTEM-PROMPT-OVERRIDE"}
 
 
+class FakeCommandMemory(FakeMemory):
+    """FakeMemory plus the command-path methods, recording cutoff calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.cutoffs: list[str] = []
+
+    async def set_history_cutoff(self, peer):
+        self.cutoffs.append(peer)
+
+    async def count(self, peer):
+        return len(self.remembered)
+
+    async def total(self):
+        return len(self.remembered)
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_intercepts_command_no_memory_no_llm():
+    """A /command is handled in-band: reply sent once, nothing stored, model
+    never called."""
+    from jeff.commands import build_command_registry
+
+    handle = FakeHandle()
+    memory = FakeCommandMemory()
+    ollama = FakeOllama(reply="should not be used")
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "/new", None, None, build_command_registry()
+    )
+
+    # The soft-reset ran, exactly one reply went out, and the model was never
+    # consulted — nor was the command stored as a conversational turn.
+    assert memory.cutoffs == ["EpeerD"]
+    assert len(handle.sent) == 1 and handle.sent[0][0] == "EpeerD"
+    assert ollama.chat_calls == []
+    assert memory.remembered == []
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_unknown_command_does_not_reach_llm():
+    from jeff.commands import build_command_registry
+
+    handle = FakeHandle()
+    memory = FakeCommandMemory()
+    ollama = FakeOllama(reply="should not be used")
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "/bogus", None, None, build_command_registry()
+    )
+
+    assert ollama.chat_calls == []
+    assert memory.remembered == []
+    assert len(handle.sent) == 1
+    assert "Unknown command" in handle.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_normal_text_with_commands_still_runs_turn():
+    """Non-/ text falls through to the normal turn even when commands are wired."""
+    from jeff.commands import build_command_registry
+
+    handle = FakeHandle()
+    memory = FakeCommandMemory()
+    ollama = FakeOllama(reply="hi there")
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "hello", None, None, build_command_registry()
+    )
+
+    assert handle.sent == [("EpeerD", "hi there")]
+    assert len(ollama.chat_calls) == 1
+    assert ("EpeerD", "user", "hello") in memory.remembered
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_commands_disabled_treats_slash_as_normal_text():
+    from jeff.commands import build_command_registry
+
+    handle = FakeHandle()
+    memory = FakeCommandMemory()
+    ollama = FakeOllama(reply="llm reply")
+    cfg = _tools_cfg(JEFF_COMMANDS_ENABLED="false")
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "/new", None, None, build_command_registry()
+    )
+
+    # Commands off → "/new" is just text: it hits the LLM and is remembered.
+    assert memory.cutoffs == []
+    assert len(ollama.chat_calls) == 1
+    assert ("EpeerD", "user", "/new") in memory.remembered
+
+
 class _FakeEventsHandle:
     """Minimal ServiceHandle-like object for driving `_drain_events` in tests."""
 

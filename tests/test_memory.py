@@ -127,6 +127,67 @@ async def test_recall_scopes_by_peer(pool):
 
 
 @pytest.mark.asyncio
+async def test_new_cutoff_resets_recent_but_recall_still_spans_all(pool):
+    """`/new` semantics: set_history_cutoff drops older rows from the recent
+    window, while recall() (long-term semantic memory) still finds them."""
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    # Pre-cutoff content the operator wants out of the active thread.
+    await mem.remember("EabcD", "user", "I love cycling")
+    await mem.set_history_cutoff("EabcD")
+    # Post-cutoff content (the new conversation).
+    await mem.remember("EabcD", "user", "espresso every morning")
+
+    recent = await mem.recent("EabcD", n=10)
+    assert [m.content for m in recent] == ["espresso every morning"]
+
+    # recall() ignores the cutoff — the older line is still semantically
+    # retrievable if a future query is about it.
+    hits = await mem.recall("EabcD", "tell me about my bike", k=5)
+    assert any("cycling" in m.content.lower() for m in hits)
+
+
+@pytest.mark.asyncio
+async def test_forget_hard_deletes_and_clears_watermark(pool):
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    await mem.remember("EabcD", "user", "I love cycling")
+    await mem.set_history_cutoff("EabcD")
+    await mem.remember("EabcD", "user", "espresso every morning")
+    await mem.remember("EotherD", "user", "weather today?")
+
+    deleted = await mem.forget("EabcD")
+    assert deleted == 2
+    assert await mem.count("EabcD") == 0
+    # Other peers are untouched.
+    assert await mem.count("EotherD") == 1
+    assert await mem.total() == 1
+
+    # Watermark was cleared: a fresh row for EabcD is immediately visible in
+    # recent() (the stale cutoff didn't survive the wipe).
+    await mem.remember("EabcD", "user", "back again")
+    recent = await mem.recent("EabcD", n=10)
+    assert [m.content for m in recent] == ["back again"]
+
+
+@pytest.mark.asyncio
+async def test_count_and_total(pool):
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    await mem.remember("EabcD", "user", "one")
+    await mem.remember("EabcD", "assistant", "two")
+    await mem.remember("EotherD", "user", "three")
+
+    assert await mem.count("EabcD") == 2
+    assert await mem.count("EotherD") == 1
+    assert await mem.count("Enobody") == 0
+    assert await mem.total() == 3
+
+
+@pytest.mark.asyncio
 async def test_remember_rejects_dim_mismatch(pool):
     class BadEmbedder:
         async def embed(self, text, *, model):
