@@ -165,6 +165,42 @@ async def test_recall_finds_post_cutoff_rows(pool):
 
 
 @pytest.mark.asyncio
+async def test_recall_scored_returns_distances_and_honours_cutoff(pool):
+    """`/debug recall` view: scored candidates ascend by distance and are scoped
+    to the current session (pre-cutoff rows are excluded, same as recall())."""
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    await mem.remember("EabcD", "user", "I love cycling")  # pre-cutoff
+    await mem.set_history_cutoff("EabcD")
+    await mem.remember("EabcD", "user", "espresso every morning")  # post-cutoff
+
+    scored = await mem.recall_scored("EabcD", "tell me about my bike", limit=8)
+
+    contents = [m.content.lower() for m, _ in scored]
+    # Pre-cutoff "cycling" is out of session scope even though it's the closest
+    # match to "bike"; only the post-cutoff row is a candidate.
+    assert all("cycling" not in c for c in contents)
+    assert any("espresso" in c for c in contents)
+    dists = [d for _, d in scored]
+    assert dists == sorted(dists)
+    assert all(isinstance(d, float) for d in dists)
+
+
+@pytest.mark.asyncio
+async def test_get_history_cutoff_roundtrip(pool):
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    # Fresh peer — the module-scoped pool is shared, so reuse of "EabcD" would
+    # already carry a cutoff from earlier tests.
+    peer = "EnevercutD"
+    assert await mem.get_history_cutoff(peer) is None
+    await mem.set_history_cutoff(peer)
+    assert await mem.get_history_cutoff(peer) is not None
+
+
+@pytest.mark.asyncio
 async def test_forget_hard_deletes_and_clears_watermark(pool):
     emb = FakeEmbedder()
     mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)

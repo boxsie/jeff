@@ -18,6 +18,9 @@ window of its memory. Jeff therefore declares only what it uniquely owns:
                 transcript-clear). Nothing is deleted — that's `/forget`.
   - `/forget` — hard wipe of everything Jeff remembers about this peer (confirm-gated).
   - `/stats`  — memory counts, uptime, active provider/model, prompt source.
+  - `/debug`  — deterministic introspection: dump the real working context
+                (effective system prompt, session cutoff, recent window, and
+                exactly what recall would surface with cosine distances).
 
 `/help`/`/whoami` are ceded to the daemon's built-ins; the old soft `/new` is
 subsumed by the augmented `/clear`.
@@ -35,11 +38,13 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+from .memory import DEFAULT_RECALL_DISTANCE_MAX
+
 if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     import ensemble
 
     from .config import Config
-    from .memory import Memory
+    from .memory import Memory, Message
 
 
 log = logging.getLogger("jeff.commands")
@@ -58,6 +63,12 @@ class CommandContext:
     already stripped the name + prefix). `peer` is the invoking address. `handle`
     isn't used by the current commands but is here for future commands that send
     their own traffic (e.g. a `/backup` that offers a file over Ensemble).
+
+    `system_prompt` is the *effective* prompt actually sent on a turn (operator
+    base + capabilities addendum), composed once at startup; `tool_names` is the
+    registered tool set. Both are here so `/debug` can show the real working
+    context rather than reconstructing it. They default to empty so callers that
+    don't care (and older tests) need not supply them.
     """
 
     handle: "ensemble.ServiceHandle"
@@ -65,6 +76,8 @@ class CommandContext:
     cfg: "Config"
     peer: str
     args: str
+    system_prompt: str = ""
+    tool_names: tuple[str, ...] = ()
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -212,6 +225,124 @@ def _format_uptime(seconds: float) -> str:
     return " ".join(parts)
 
 
+# --- /debug: deterministic introspection ----------------------------------
+#
+# /debug prints Jeff's *real* working context — the system prompt, the session
+# cutoff, the recent window, and exactly what recall would surface (with cosine
+# distances). It's a deterministic dump, never a model call, so it can't
+# confabulate: it shows the data structures themselves. This is the truthful
+# answer to "what are you working with?" that the model can't reliably give
+# about its own context. Single-user threat model (peer == operator) means
+# exposing the prompt/messages here is fine — the operator owns both.
+
+_DEBUG_CONTENT_WIDTH = 100  # per-row content truncation in the dumps
+
+
+def _truncate(text: str, width: int = _DEBUG_CONTENT_WIDTH) -> str:
+    """One-line, length-bounded rendering of stored content for the dumps."""
+    flat = " ".join(text.split())  # collapse newlines/runs so rows stay one line
+    if len(flat) <= width:
+        return flat
+    return flat[: width - 1] + "…"
+
+
+def _fmt_ts(ts) -> str:
+    """Compact, second-resolution timestamp for the dumps."""
+    return ts.isoformat(sep=" ", timespec="seconds")
+
+
+def _fmt_msg_row(prefix: str, m: "Message") -> str:
+    # role padded to the widest value ("assistant" = 9) so columns line up.
+    return f"{prefix}#{m.id} {m.role:<9} {_fmt_ts(m.ts)}  {_truncate(m.content)}"
+
+
+async def _debug_overview(ctx: CommandContext) -> str:
+    cutoff = await ctx.memory.get_history_cutoff(ctx.peer)
+    mine = await ctx.memory.count(ctx.peer)
+    total = await ctx.memory.total()
+    recent = await ctx.memory.recent(ctx.peer, n=ctx.cfg.recent_turns)
+    prompt = ctx.system_prompt or ctx.cfg.system_prompt
+
+    lines = [
+        "session cutoff: "
+        + (_fmt_ts(cutoff) if cutoff else "(none — full history in window)"),
+        f"stored msgs:    you={mine}  all peers={total}",
+        f"knobs:          recent_turns={ctx.cfg.recent_turns}  recall_k={ctx.cfg.recall_k}"
+        f"  recall_dist<={DEFAULT_RECALL_DISTANCE_MAX}",
+        f"system prompt:  {len(prompt)} chars  (source={ctx.cfg.system_prompt_source})",
+        "tools:          " + (", ".join(ctx.tool_names) if ctx.tool_names else "(none)"),
+        f"recent window ({len(recent)} / max {ctx.cfg.recent_turns}):",
+    ]
+    if recent:
+        lines.extend(_fmt_msg_row("  ", m) for m in recent)
+    else:
+        lines.append("  (empty — fresh session)")
+
+    body = "\n".join(lines)
+    return (
+        "**debug — context**\n```\n" + body + "\n```\n"
+        "`/debug prompt` for the full system prompt · "
+        "`/debug recall <query>` to test what I'd recall."
+    )
+
+
+def _debug_prompt(ctx: CommandContext) -> str:
+    prompt = ctx.system_prompt or ctx.cfg.system_prompt
+    return (
+        f"**debug — effective system prompt** "
+        f"(source={ctx.cfg.system_prompt_source}, {len(prompt)} chars)\n"
+        "```\n" + prompt + "\n```"
+    )
+
+
+async def _debug_recall(ctx: CommandContext, query: str) -> str:
+    # Pull a few extra beyond recall_k so near-misses just over the threshold are
+    # visible (the whole point of a tuning view). The live recall() keeps the
+    # first recall_k rows with dist <= DEFAULT_RECALL_DISTANCE_MAX; because rows
+    # are distance-ordered, those are exactly the leading ✓ rows below.
+    scored = await ctx.memory.recall_scored(
+        ctx.peer, query, limit=ctx.cfg.recall_k + 3
+    )
+    lines = [
+        f'query: "{_truncate(query, 80)}"',
+        f"kept by a real turn: ✓ = dist <= {DEFAULT_RECALL_DISTANCE_MAX} and within recall_k={ctx.cfg.recall_k}",
+    ]
+    if not scored:
+        lines.append("(no candidates this session — nothing stored since the cutoff)")
+    for i, (m, dist) in enumerate(scored):
+        kept = dist <= DEFAULT_RECALL_DISTANCE_MAX and i < ctx.cfg.recall_k
+        mark = "✓" if kept else " "
+        lines.append(f"{mark} {dist:.3f}  " + _fmt_msg_row("", m))
+    body = "\n".join(lines)
+    return "**debug — recall**\n```\n" + body + "\n```"
+
+
+async def _cmd_debug(ctx: CommandContext) -> str:
+    """Deterministic introspection: show the real context Jeff is working with.
+
+    Subcommands: bare `/debug` (overview), `/debug prompt` (full system prompt),
+    `/debug recall <query>` (what recall would surface, with distances).
+    """
+    sub = ctx.args.strip()
+    low = sub.lower()
+    if not sub:
+        return await _debug_overview(ctx)
+    if low == "prompt":
+        return _debug_prompt(ctx)
+    if low == "recall" or low.startswith("recall "):
+        query = sub[len("recall"):].strip()
+        if not query:
+            return (
+                "Usage: `/debug recall <query>` — shows what I'd recall for that "
+                "text, with cosine distances."
+            )
+        return await _debug_recall(ctx, query)
+    return (
+        "Unknown debug view. Try `/debug` (overview), `/debug prompt`, or "
+        "`/debug recall <query>`."
+    )
+
+
 def build_command_registry() -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`."""
@@ -229,5 +360,11 @@ def build_command_registry() -> CommandRegistry:
                 usage="yes",
             ),
             Command("stats", "memory counts, uptime, and active model", _cmd_stats),
+            Command(
+                "debug",
+                "inspect my working context (prompt, recent window, recall)",
+                _cmd_debug,
+                usage="[prompt|recall <query>]",
+            ),
         ]
     )

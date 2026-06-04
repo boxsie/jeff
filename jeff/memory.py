@@ -30,6 +30,12 @@ class _Embedder(Protocol):
 # operator bumps of JEFF_MAX_MESSAGE_BYTES don't immediately hit this.
 MAX_CONTENT_BYTES = 65536
 
+# Default cosine-distance ceiling for recall(). A row further than this from the
+# query isn't relevant enough to feed the model (see recall() for the rationale).
+# Factored out as a module constant so the turn path and the /debug recall view
+# mark the same threshold instead of hard-coding 0.4 in two places.
+DEFAULT_RECALL_DISTANCE_MAX = 0.4
+
 
 @dataclass(frozen=True)
 class Message:
@@ -180,7 +186,7 @@ class Memory:
         query: str,
         k: int = 5,
         *,
-        distance_max: float = 0.4,
+        distance_max: float = DEFAULT_RECALL_DISTANCE_MAX,
     ) -> list[Message]:
         # Session scope: like recent(), recall now honours the per-peer
         # history_cutoff, so `/clear` gives a genuinely fresh session —
@@ -224,6 +230,54 @@ class Memory:
                 role=r[2],
                 content=strip_chat_template_tokens(r[3]),
                 ts=r[4],
+            )
+            for r in rows
+        ]
+
+    async def recall_scored(
+        self,
+        peer: str,
+        query: str,
+        *,
+        limit: int = 8,
+    ) -> list[tuple[Message, float]]:
+        """Introspection view for `/debug recall`: the closest rows to `query`
+        with their cosine distances, honouring the session cutoff.
+
+        Unlike recall(), this deliberately does NOT filter by distance_max — it
+        returns the top `limit` candidates ordered by distance so the operator
+        can see the near-misses just over the threshold (useful for tuning
+        DEFAULT_RECALL_DISTANCE_MAX). It still respects the cutoff, so it mirrors
+        the session scope a real turn would see. The caller decides which rows
+        the live recall() would actually have kept.
+        """
+        emb = await self._embedder.embed(query, model=self._embed_model)
+        vec = np.asarray(emb, dtype=np.float32)
+        async with self._pool.connection() as conn:
+            await register_vector_async(conn)
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT id, peer, role, content, ts, (embedding <=> %s) AS dist "
+                    "FROM messages "
+                    "WHERE peer = %s "
+                    "  AND ts > COALESCE("
+                    "    (SELECT history_cutoff FROM peer_state WHERE peer = %s), "
+                    "    '-infinity'::timestamptz) "
+                    "ORDER BY embedding <=> %s "
+                    "LIMIT %s",
+                    (vec, peer, peer, vec, limit),
+                )
+                rows = await cur.fetchall()
+        return [
+            (
+                Message(
+                    id=r[0],
+                    peer=r[1],
+                    role=r[2],
+                    content=strip_chat_template_tokens(r[3]),
+                    ts=r[4],
+                ),
+                float(r[5]),
             )
             for r in rows
         ]
@@ -302,6 +356,21 @@ class Memory:
                     (peer,),
                 )
             await conn.commit()
+
+    async def get_history_cutoff(self, peer: str) -> datetime | None:
+        """The peer's current session watermark, or None if never `/clear`-ed.
+
+        Read-only companion to set_history_cutoff, used by `/debug` to show where
+        the active session starts. None means the whole history is in scope.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT history_cutoff FROM peer_state WHERE peer = %s",
+                    (peer,),
+                )
+                row = await cur.fetchone()
+        return row[0] if row else None
 
     async def count(self, peer: str) -> int:
         """How many stored messages this peer has (for `/stats`)."""

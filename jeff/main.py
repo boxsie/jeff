@@ -272,7 +272,15 @@ async def run(cfg: Config) -> None:
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
 
                     events_task = asyncio.create_task(
-                        _drain_events(handle, dispatcher, cfg, memory, commands),
+                        _drain_events(
+                            handle,
+                            dispatcher,
+                            cfg,
+                            memory,
+                            commands,
+                            system_prompt,
+                            tuple(registry.names()),
+                        ),
                         name="jeff-events",
                     )
                     stop_task = asyncio.create_task(stop.wait(), name="jeff-stop")
@@ -297,6 +305,8 @@ async def _handle_command(
     cfg: Config,
     commands: CommandRegistry,
     inv: ensemble.CommandInvocation,
+    system_prompt: str = "",
+    tool_names: tuple[str, ...] = (),
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -305,6 +315,9 @@ async def _handle_command(
     reply send — wrapped on its own so a send fault can't escape the event loop.
     The reply goes back as a CommandResult (not a chat message), so the daemon
     can merge it with its own built-in leg under the augment model.
+
+    `system_prompt`/`tool_names` are the effective turn context, passed through to
+    CommandContext so `/debug` can show what Jeff actually works with.
     """
     ctx = CommandContext(
         handle=handle,
@@ -312,6 +325,8 @@ async def _handle_command(
         cfg=cfg,
         peer=inv.from_addr,
         args=inv.args,
+        system_prompt=system_prompt,
+        tool_names=tool_names,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -326,6 +341,8 @@ async def _drain_events(
     cfg: Config,
     memory: Memory | None = None,
     commands: CommandRegistry | None = None,
+    system_prompt: str = "",
+    tool_names: tuple[str, ...] = (),
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
@@ -340,7 +357,9 @@ async def _drain_events(
             # Commands are fast, deterministic, and never call the model, so they
             # run inline rather than through the turn dispatcher (which rate-limits
             # and serialises LLM turns).
-            await _handle_command(handle, memory, cfg, commands, event)
+            await _handle_command(
+                handle, memory, cfg, commands, event, system_prompt, tool_names
+            )
             continue
         if not isinstance(event, ensemble.ChatMessage):
             continue
