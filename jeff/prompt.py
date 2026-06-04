@@ -1,11 +1,18 @@
 """System prompt + chat-history assembly.
 
-`build_history` produces an Ollama-shaped messages list:
-    [system, ...recall, ...recent, user_turn]
+`build_history` produces an OpenAI/Ollama-shaped messages list:
+    [system (+ "things you remember" block), ...recent thread, user_turn]
 
-Recall and recent windows can overlap (a recently-said message is also a good
-semantic match for a follow-up question). De-duplicate by message id so the
-LLM doesn't see the same line twice.
+Two kinds of memory are kept deliberately distinct:
+  - the live thread — the `recent` window, rendered as real chat turns;
+  - cross-thread memories — surfaced by semantic `recall`, rendered as a
+    labelled block appended to the system message so Jeff references them *as*
+    memories ("remember when…") rather than as part of the current exchange.
+
+Anything already present in the recent thread is dropped from the memories block
+so the model never sees the same line twice. Peer-authored recalled lines stay
+wrapped in <peer_message> so the system prompt's untrusted-data rule governs them
+even inside the system message.
 """
 
 from __future__ import annotations
@@ -103,16 +110,30 @@ def _to_chat(messages: Iterable[Message]) -> list[dict]:
     return out
 
 
-def _dedup_preserve_order(*windows: list[Message]) -> list[Message]:
-    seen: set[int] = set()
-    out: list[Message] = []
-    for w in windows:
-        for m in w:
-            if m.id in seen:
-                continue
-            seen.add(m.id)
-            out.append(m)
-    return out
+def _render_memories(older: list[Message]) -> str:
+    """Render cross-thread recalled memories as a labelled block for the system
+    message. Returns "" when there's nothing to show.
+
+    Peer-authored ("user") lines stay wrapped in <peer_message> so the system
+    prompt's untrusted-data rule still governs them here; the assistant's own
+    past lines are trusted self-output and aren't wrapped. Speaker is labelled
+    ("them"/"you") so the model treats these as recollections, not live turns.
+    """
+    if not older:
+        return ""
+    lines = [
+        "## Things you remember",
+        "These surfaced from your memory of earlier conversations "
+        "(most relevant first). Bring them up naturally only if they fit — "
+        "don't force them or read them back like a list.",
+    ]
+    for m in older:
+        content = strip_chat_template_tokens(m.content)
+        if m.role == "user":
+            lines.append(f"- them: <peer_message>{content}</peer_message>")
+        else:
+            lines.append(f"- you: {content}")
+    return "\n".join(lines)
 
 
 async def build_history(
@@ -140,16 +161,22 @@ async def build_history(
     )
     recent = await memory.recent(peer, n=recent_turns)
 
-    # Recent wins on overlap (preserves natural chronological tail);
-    # recalled-but-not-recent is sorted chronologically before recent.
+    # Split the live thread from cross-thread memory. older_recall keeps recall's
+    # own order (most relevant first) and drops anything already in the recent
+    # thread, so the same line never appears twice.
     recent_ids = {m.id for m in recent}
-    older_recall = sorted(
-        (m for m in recalled if m.id not in recent_ids),
-        key=lambda m: m.ts,
+    older_recall = [m for m in recalled if m.id not in recent_ids]
+
+    # Memories ride in the system message (a labelled block); the recent thread
+    # is the actual conversation. When there's nothing recalled, the system
+    # message is the prompt verbatim (preserves the operator's exact prompt).
+    memories = _render_memories(older_recall)
+    system_content = (
+        f"{system_prompt.rstrip()}\n\n{memories}" if memories else system_prompt
     )
 
-    history: list[dict] = [{"role": "system", "content": system_prompt}]
-    history.extend(_to_chat(_dedup_preserve_order(older_recall, recent)))
+    history: list[dict] = [{"role": "system", "content": system_content}]
+    history.extend(_to_chat(recent))
     history.append(
         {"role": "user", "content": f"<peer_message>{user_text}</peer_message>"}
     )
