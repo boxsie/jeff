@@ -127,13 +127,14 @@ async def test_recall_scopes_by_peer(pool):
 
 
 @pytest.mark.asyncio
-async def test_new_cutoff_resets_recent_but_recall_still_spans_all(pool):
-    """`/new` semantics: set_history_cutoff drops older rows from the recent
-    window, while recall() (long-term semantic memory) still finds them."""
+async def test_clear_cutoff_scopes_both_recent_and_recall(pool):
+    """`/clear` semantics: set_history_cutoff starts a fresh session — it drops
+    older rows from BOTH the recent window and semantic recall, so pre-clear
+    lines can't bleed back in via topical similarity."""
     emb = FakeEmbedder()
     mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
 
-    # Pre-cutoff content the operator wants out of the active thread.
+    # Pre-cutoff content the operator wants out of the active session.
     await mem.remember("EabcD", "user", "I love cycling")
     await mem.set_history_cutoff("EabcD")
     # Post-cutoff content (the new conversation).
@@ -142,8 +143,23 @@ async def test_new_cutoff_resets_recent_but_recall_still_spans_all(pool):
     recent = await mem.recent("EabcD", n=10)
     assert [m.content for m in recent] == ["espresso every morning"]
 
-    # recall() ignores the cutoff — the older line is still semantically
-    # retrievable if a future query is about it.
+    # recall() now honours the cutoff: a query about the pre-clear topic finds
+    # nothing from before the cutoff (the row still exists, it's just out of
+    # this session's reach).
+    hits = await mem.recall("EabcD", "tell me about my bike", k=5)
+    assert all("cycling" not in m.content.lower() for m in hits)
+
+
+@pytest.mark.asyncio
+async def test_recall_finds_post_cutoff_rows(pool):
+    """The cutoff scopes recall to the current session, but still finds rows
+    created after the cutoff — a fresh session has working semantic memory."""
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    await mem.set_history_cutoff("EabcD")
+    await mem.remember("EabcD", "user", "I love cycling")
+
     hits = await mem.recall("EabcD", "tell me about my bike", k=5)
     assert any("cycling" in m.content.lower() for m in hits)
 

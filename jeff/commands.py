@@ -12,8 +12,10 @@ behaviour). That's why `/clear` works as one keystroke — the daemon's built-in
 clears the operator's local transcript while Jeff's `/clear` resets the working
 window of its memory. Jeff therefore declares only what it uniquely owns:
 
-  - `/clear`  — session reset: drop the active thread from the recent window,
-                keep long-term semantic memory (augments the daemon transcript-clear).
+  - `/clear`  — session reset: start a fresh session. Both the recent window
+                and semantic recall are scoped past the cutoff, so pre-clear
+                lines won't resurface this session (augments the daemon
+                transcript-clear). Nothing is deleted — that's `/forget`.
   - `/forget` — hard wipe of everything Jeff remembers about this peer (confirm-gated).
   - `/stats`  — memory counts, uptime, active provider/model, prompt source.
 
@@ -142,15 +144,20 @@ class CommandRegistry:
 
 
 async def _cmd_clear(ctx: CommandContext) -> str:
-    """Session reset: drop the active thread from the conversational window but
-    keep long-term semantic memory (older lines can still resurface via recall).
+    """Session reset: start a fresh session by advancing the history cutoff.
+
+    Both the conversational window (`recent`) and semantic recall are scoped to
+    rows newer than the cutoff, so pre-clear lines won't bleed into the new
+    session. Nothing is deleted — the rows stay in the store for a future
+    cross-session recall feature; `/forget` is the hard wipe.
 
     This is the service leg of the daemon's `/clear` augment — the daemon clears
-    the operator's local transcript; this clears Jeff's working window."""
+    the operator's local transcript; this clears Jeff's working memory window."""
     await ctx.memory.set_history_cutoff(ctx.peer)
     return (
-        "Started a fresh conversation — I've cleared this thread from my active "
-        "memory. I'll still remember older things if they come up naturally."
+        "Started a fresh conversation — clean slate for this session. Your "
+        "earlier messages are still stored but I won't pull them into this "
+        "thread. Use `/forget` if you want them gone for good."
     )
 
 

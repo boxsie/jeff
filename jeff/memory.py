@@ -67,12 +67,14 @@ _DDL_IDX_EMBEDDING = sql.SQL(
     "ON messages USING hnsw (embedding vector_cosine_ops)"
 )
 
-# Per-peer control state. `history_cutoff` is the soft-reset watermark for the
-# `/new` chat command (jeff ticket dc1791d5): `recent()` only returns rows
-# newer than it, so the active conversational window starts fresh, while
-# `recall()` deliberately ignores it — long-term semantic memory still spans
-# everything. No embedding here, so it's a plain CREATE TABLE (no env-derived
-# dimension), but kept in the same idempotent psycopg.sql shape as the rest.
+# Per-peer control state. `history_cutoff` is the session watermark for the
+# `/clear` chat command (jeff ticket dc1791d5): BOTH `recent()` and `recall()`
+# only return rows newer than it, so `/clear` starts a genuinely fresh session
+# — the active window empties and semantic recall is scoped to the new session.
+# Pre-cutoff rows still exist (only `/forget` deletes); cross-session recall is
+# a deliberate future step. No embedding here, so it's a plain CREATE TABLE (no
+# env-derived dimension), but kept in the same idempotent psycopg.sql shape as
+# the rest.
 _DDL_PEER_STATE = sql.SQL(
     "CREATE TABLE IF NOT EXISTS peer_state ("
     "peer TEXT PRIMARY KEY, "
@@ -180,6 +182,14 @@ class Memory:
         *,
         distance_max: float = 0.4,
     ) -> list[Message]:
+        # Session scope: like recent(), recall now honours the per-peer
+        # history_cutoff, so `/clear` gives a genuinely fresh session —
+        # semantic recall no longer drags pre-clear lines back into context
+        # the moment a new message is topically similar. Rows older than the
+        # cutoff still exist (they're not deleted — that's /forget's job);
+        # they're simply out of reach until cross-session recall is added.
+        # COALESCE to -infinity so the no-cutoff case is unchanged.
+        #
         # W3 #dc9acd3c: pgvector "<=>" returns cosine *distance* (0 =
         # identical, 1 = orthogonal). Two reasons to floor it:
         #   1. Near-zero distance means a stored row that looks just like
@@ -198,10 +208,13 @@ class Memory:
                 await cur.execute(
                     "SELECT id, peer, role, content, ts FROM messages "
                     "WHERE peer = %s "
+                    "  AND ts > COALESCE("
+                    "    (SELECT history_cutoff FROM peer_state WHERE peer = %s), "
+                    "    '-infinity'::timestamptz) "
                     "  AND (embedding <=> %s) <= %s "
                     "ORDER BY embedding <=> %s "
                     "LIMIT %s",
-                    (peer, vec, distance_max, vec, k),
+                    (peer, peer, vec, distance_max, vec, k),
                 )
                 rows = await cur.fetchall()
         return [
@@ -216,11 +229,11 @@ class Memory:
         ]
 
     async def recent(self, peer: str, n: int = 10) -> list[Message]:
-        # Respect the soft-reset watermark: after `/new` (set_history_cutoff),
+        # Respect the session watermark: after `/clear` (set_history_cutoff),
         # the conversational window only includes rows newer than the cutoff.
         # COALESCE to -infinity when no cutoff is set so the unfiltered case is
-        # identical to before. recall() is deliberately NOT filtered this way —
-        # long-term semantic memory still spans everything.
+        # identical to before. recall() now applies the same filter, so a
+        # cleared session is fresh in both windows.
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(

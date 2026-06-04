@@ -66,7 +66,11 @@ async def handle_turn(
     don't pollute recall.
     """
     try:
-        await memory.remember(peer, "user", text)
+        # Build the prompt BEFORE persisting the current user message.
+        # build_history appends the current turn explicitly; if we stored it
+        # first, recent()/recall() would also return it and the message would
+        # appear twice in the prompt. Per-peer turns are serialised by the
+        # dispatcher, so there's no interleaving risk in reordering this.
         history = await build_history(
             memory,
             peer,
@@ -75,6 +79,9 @@ async def handle_turn(
             recall_k=cfg.recall_k,
             system_prompt=system_prompt or cfg.system_prompt,
         )
+        # Persist after building but before the model call, so the user turn is
+        # still recorded even if the chat/tool call fails (matches prior behaviour).
+        await memory.remember(peer, "user", text)
         if registry is not None and cfg.tools_enabled and len(registry):
             reply = await _run_tool_loop(chat_provider, registry, history, cfg)
         else:
