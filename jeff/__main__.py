@@ -18,6 +18,7 @@ from .curiosity import CuriosityStore
 from .main import run as _run
 from .memory import Memory
 from .ollama import Ollama
+from .reflection import ReflectionStore
 
 
 def run() -> None:
@@ -100,9 +101,18 @@ async def _reset_memory(cfg: Config) -> None:
                 embed_dim=cfg.embed_dim,
             )
             await curiosity.reset()
+            # Derived memory (facts + opinions) is embedded at the same dim, so a
+            # dimension change invalidates it too — recreate it alongside.
+            reflection = ReflectionStore(
+                pool,
+                ollama,
+                embed_model=cfg.embed_model,
+                embed_dim=cfg.embed_dim,
+            )
+            await reflection.reset()
             print(
-                f"memory reset — messages + curiosities schema recreated at "
-                f"dim={cfg.embed_dim} (model={cfg.embed_model})"
+                f"memory reset — messages + curiosities + derived_memory schema "
+                f"recreated at dim={cfg.embed_dim} (model={cfg.embed_model})"
             )
     finally:
         await pool.close()

@@ -308,6 +308,91 @@ async def test_handle_turn_without_curiosity_makes_no_curiosity_calls():
     assert "## You're curious about" not in system["content"]
 
 
+class FakeReflectionStore:
+    def __init__(self, facts=None, opinions=None, *, boom: bool = False):
+        self._facts = facts or []
+        self._opinions = opinions or []
+        self._boom = boom
+        self.persona_calls: list[tuple[str, int]] = []
+
+    async def persona(self, peer, *, max_chars):
+        self.persona_calls.append((peer, max_chars))
+        if self._boom:
+            raise RuntimeError("DSN=postgresql://secret store down")
+        return list(self._facts), list(self._opinions)
+
+
+class FakeReflector:
+    def __init__(self):
+        self.reflect_calls: list[str] = []
+
+    async def maybe_reflect(self, peer):
+        self.reflect_calls.append(peer)
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_injects_persona_and_fires_reflection():
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="sure")
+    memory = FakeMemory()
+    store = FakeReflectionStore(
+        facts=["Works as a backend developer"], opinions=["I like their bluntness"]
+    )
+    reflector = FakeReflector()
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "hey",
+        None, None, None, None, store, reflector,
+    )
+
+    system = ollama.chat_calls[0][0]
+    assert system["role"] == "system"
+    assert "## What you've come to know" in system["content"]
+    assert "Works as a backend developer" in system["content"]
+    assert "I like their bluntness" in system["content"]
+    # Persona was fetched with the configured char cap; reflection fired post-reply.
+    assert store.persona_calls == [("EpeerD", cfg.persona_max_chars)]
+    assert reflector.reflect_calls == ["EpeerD"]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_survives_persona_read_fault():
+    """Persona is additive: a store read fault must not break the reply or leak
+    DSN/exception text — the turn proceeds with no persona block."""
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="still here")
+    memory = FakeMemory()
+    store = FakeReflectionStore(boom=True)
+    reflector = FakeReflector()
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "hey",
+        None, None, None, None, store, reflector,
+    )
+
+    assert handle.sent == [("EpeerD", "still here")]
+    system = ollama.chat_calls[0][0]
+    assert "## What you've come to know" not in system["content"]
+    # Reflection still fires for the completed exchange.
+    assert reflector.reflect_calls == ["EpeerD"]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_without_reflection_makes_no_persona_calls():
+    """Flag-off parity: no store/reflector → no persona block, byte-identical."""
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="ok")
+    memory = FakeMemory()
+    cfg = _cfg()
+
+    await handle_turn(handle, memory, ollama, cfg, "EpeerD", "hey")
+
+    system = ollama.chat_calls[0][0]
+    assert "## What you've come to know" not in system["content"]
+
+
 @pytest.mark.asyncio
 async def test_handle_turn_uses_passed_system_prompt():
     handle = FakeHandle()

@@ -228,6 +228,87 @@ async def test_build_history_memories_and_curiosities_coexist():
     assert "## You're curious about" in content
 
 
+@pytest.mark.asyncio
+async def test_build_history_injects_persona_block_when_present():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        facts=["Works as a backend developer", "Rides a steel road bike"],
+        opinions=["I like their blunt technical questions"],
+    )
+    content = history[0]["content"]
+    assert content.startswith(SYSTEM_PROMPT)
+    assert "## What you've come to know" in content
+    assert "About them:" in content
+    assert "- Works as a backend developer" in content
+    assert "Your own take:" in content
+    assert "- I like their blunt technical questions" in content
+    # Persona items are Jeff's own distilled notes — NOT wrapped as peer text.
+    assert "<peer_message>Works as a backend developer" not in content
+
+
+@pytest.mark.asyncio
+async def test_build_history_persona_subsections_appear_only_when_nonempty():
+    mem = FakeMemory(recall=[], recent=[])
+    # Facts only → no "Your own take:" subsection.
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        facts=["Prefers Python to Go"],
+        opinions=[],
+    )
+    content = history[0]["content"]
+    assert "## What you've come to know" in content
+    assert "About them:" in content
+    assert "Your own take:" not in content
+
+
+@pytest.mark.asyncio
+async def test_build_history_no_persona_block_when_empty():
+    # No facts/opinions (the default, and whenever reflection is off) → the system
+    # message is the prompt verbatim, byte-identical to before the feature.
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+    )
+    assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert "## What you've come to know" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_build_history_persona_leads_the_extra_blocks():
+    # When all three blocks are present the persona (standing character) comes
+    # first, then recalled memories, then open curiosities.
+    recall = [_msg(1, "user", "I love cycling", mins_ago=120)]
+    mem = FakeMemory(recall, [])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        curiosities=["Road or MTB?"],
+        facts=["Rides a steel road bike"],
+    )
+    content = history[0]["content"]
+    assert (
+        content.index("## What you've come to know")
+        < content.index("## Things you remember")
+        < content.index("## You're curious about")
+    )
+
+
 # W3 #dc9acd3c: SYSTEM_PROMPT must survive a turn whose recall contains a
 # "ignore previous instructions" string. We don't test LLM behavior here —
 # only that the assembled messages list still has the system prompt as the

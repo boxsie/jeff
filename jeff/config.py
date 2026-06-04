@@ -195,6 +195,13 @@ class Config:
     curiosity_max_open: int
     curiosity_max_new_per_pass: int
 
+    reflection_enabled: bool
+    reflection_every_turns: int
+    reflection_max_chars: int
+    reflection_max_items: int
+    reflection_use_persona: bool
+    persona_max_chars: int
+
     max_inflight: int
     per_peer_concurrency: int
     peer_rate_per_minute: float
@@ -284,6 +291,19 @@ class Config:
             curiosity_every_turns=int(e.get("JEFF_CURIOSITY_EVERY_TURNS", "1")),
             curiosity_max_open=int(e.get("JEFF_CURIOSITY_MAX_OPEN", "6")),
             curiosity_max_new_per_pass=int(e.get("JEFF_CURIOSITY_MAX_NEW", "3")),
+            # Reflection / emergent personality (motivation-system slice 2) —
+            # default OFF: when off the store/reflector are never built, so
+            # behaviour is byte-identical. Defaults mirror the deployed configmap.
+            reflection_enabled=_parse_bool(e.get("JEFF_REFLECTION_ENABLED", "false")),
+            reflection_every_turns=int(e.get("JEFF_REFLECTION_EVERY_TURNS", "20")),
+            reflection_max_chars=int(e.get("JEFF_REFLECTION_MAX_CHARS", "6000")),
+            reflection_max_items=int(e.get("JEFF_REFLECTION_MAX_ITEMS", "6")),
+            # Feed the base persona into the distillation pass (default on) so
+            # opinions inherit Jeff's voice. Off → the neutral extractor only.
+            reflection_use_persona=_parse_bool(
+                e.get("JEFF_REFLECTION_USE_PERSONA", "true")
+            ),
+            persona_max_chars=int(e.get("JEFF_PERSONA_MAX_CHARS", "2000")),
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),

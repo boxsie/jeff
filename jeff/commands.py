@@ -45,6 +45,7 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     from .config import Config
     from .curiosity import CuriosityStore
     from .memory import Memory, Message
+    from .reflection import ReflectionStore
 
 
 log = logging.getLogger("jeff.commands")
@@ -68,8 +69,9 @@ class CommandContext:
     base + capabilities addendum), composed once at startup; `tool_names` is the
     registered tool set. Both are here so `/debug` can show the real working
     context rather than reconstructing it. `curiosity` is the open-questions store
-    (None when the curiosity drive is off) so `/mind` can show it and `/forget`
-    can wipe it. They default to empty/None so callers that don't care (and older
+    (None when the curiosity drive is off) and `reflection` is the derived persona
+    store (None when reflection is off) so `/mind` can show them and `/forget` can
+    wipe them. They default to empty/None so callers that don't care (and older
     tests) need not supply them.
     """
 
@@ -81,6 +83,7 @@ class CommandContext:
     system_prompt: str = ""
     tool_names: tuple[str, ...] = ()
     curiosity: "CuriosityStore | None" = None
+    reflection: "ReflectionStore | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -190,10 +193,13 @@ async def _cmd_forget(ctx: CommandContext) -> str:
             "conversations — there's no undo. If you're sure, send `/forget yes`."
         )
     deleted = await ctx.memory.forget(ctx.peer)
-    # Wipe the curiosity store too (when the drive is on) so a clean slate really
-    # is clean — open questions are derived from the same conversations.
+    # Wipe the derived stores too (when those drives are on) so a clean slate
+    # really is clean — open questions and the persona are both distilled from
+    # the same conversations.
     if ctx.curiosity is not None:
         await ctx.curiosity.forget(ctx.peer)
+    if ctx.reflection is not None:
+        await ctx.reflection.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -354,32 +360,60 @@ async def _cmd_debug(ctx: CommandContext) -> str:
 
 
 async def _cmd_mind(ctx: CommandContext) -> str:
-    """Show what's on Jeff's mind: open questions it wants to ask, and the most
-    recently answered ones. Deterministic dump (no model call), sibling to
-    `/debug`. Only declared when the curiosity drive is enabled."""
-    if ctx.curiosity is None:
-        return "Curiosity isn't switched on right now, so there's nothing on my mind to show."
-    open_cur = await ctx.curiosity.open_curiosities(ctx.peer, limit=20)
-    satisfied = await ctx.curiosity.recently_satisfied(ctx.peer, limit=5)
+    """Show what's on Jeff's mind: open questions it wants to ask (curiosity) and
+    the facts + opinions it has formed (reflection). Deterministic dump (no model
+    call), sibling to `/debug`. Declared whenever either drive is enabled; each
+    section appears only when its store is present.
+    """
+    if ctx.curiosity is None and ctx.reflection is None:
+        return (
+            "Neither curiosity nor reflection is switched on right now, so there's "
+            "nothing on my mind to show."
+        )
 
-    lines = [f"open questions ({len(open_cur)}):"]
-    if open_cur:
-        lines.extend(f"  • {_truncate(c.text)}" for c in open_cur)
-    else:
-        lines.append("  (nothing yet — I get curious as we talk)")
-    if satisfied:
-        lines.append(f"recently answered ({len(satisfied)}):")
-        lines.extend(f"  ✓ {_truncate(c.text)}" for c in satisfied)
+    sections: list[str] = []
 
-    body = "\n".join(lines)
+    if ctx.curiosity is not None:
+        open_cur = await ctx.curiosity.open_curiosities(ctx.peer, limit=20)
+        satisfied = await ctx.curiosity.recently_satisfied(ctx.peer, limit=5)
+        lines = [f"open questions ({len(open_cur)}):"]
+        if open_cur:
+            lines.extend(f"  • {_truncate(c.text)}" for c in open_cur)
+        else:
+            lines.append("  (nothing yet — I get curious as we talk)")
+        if satisfied:
+            lines.append(f"recently answered ({len(satisfied)}):")
+            lines.extend(f"  ✓ {_truncate(c.text)}" for c in satisfied)
+        sections.append("\n".join(lines))
+
+    if ctx.reflection is not None:
+        from .reflection import FACT, REFLECTION
+
+        facts = await ctx.reflection.fetch(ctx.peer, kind=FACT, limit=20)
+        opinions = await ctx.reflection.fetch(ctx.peer, kind=REFLECTION, limit=20)
+        lines = [f"what I know about you ({len(facts)}):"]
+        if facts:
+            lines.extend(f"  • {_truncate(d.text)}" for d in facts)
+        else:
+            lines.append("  (nothing yet — I learn as we talk)")
+        lines.append(f"my own take ({len(opinions)}):")
+        if opinions:
+            lines.extend(f"  • {_truncate(d.text)}" for d in opinions)
+        else:
+            lines.append("  (no opinions formed yet)")
+        sections.append("\n".join(lines))
+
+    body = "\n\n".join(sections)
     return "**on my mind**\n```\n" + body + "\n```"
 
 
-def build_command_registry(*, curiosity_enabled: bool = False) -> CommandRegistry:
+def build_command_registry(
+    *, curiosity_enabled: bool = False, reflection_enabled: bool = False
+) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
 
-    `/mind` is declared only when the curiosity drive is on — keeping the
+    `/mind` is declared only when curiosity OR reflection is on — keeping the
     feature-off path's declared command set unchanged."""
     cmds = [
         Command(
@@ -401,8 +435,8 @@ def build_command_registry(*, curiosity_enabled: bool = False) -> CommandRegistr
             usage="[prompt|recall <query>]",
         ),
     ]
-    if curiosity_enabled:
+    if curiosity_enabled or reflection_enabled:
         cmds.append(
-            Command("mind", "show what I'm curious about right now", _cmd_mind)
+            Command("mind", "show what's on my mind right now", _cmd_mind)
         )
     return CommandRegistry(cmds)

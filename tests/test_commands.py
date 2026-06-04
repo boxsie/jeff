@@ -110,8 +110,39 @@ class _Cur:
         self.text = text
 
 
+class FakeReflectionStore:
+    """Records derived-memory reads/wipes for the /forget + /mind command paths."""
+
+    def __init__(self, facts=None, opinions=None):
+        self._facts = facts or []
+        self._opinions = opinions or []
+        self.forgotten: list[str] = []
+
+    async def fetch(self, peer, *, kind=None, limit=30):
+        from jeff.reflection import FACT
+
+        if kind == FACT:
+            return self._facts[:limit]
+        return self._opinions[:limit]
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return len(self._facts) + len(self._opinions)
+
+
+class _Derived:
+    def __init__(self, text: str):
+        self.text = text
+
+
 def _ctx(
-    memory=None, args="", cfg=None, system_prompt="", tool_names=(), curiosity=None
+    memory=None,
+    args="",
+    cfg=None,
+    system_prompt="",
+    tool_names=(),
+    curiosity=None,
+    reflection=None,
 ) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
@@ -122,6 +153,7 @@ def _ctx(
         system_prompt=system_prompt,
         tool_names=tool_names,
         curiosity=curiosity,
+        reflection=reflection,
     )
 
 
@@ -349,10 +381,12 @@ async def test_mind_lists_open_and_satisfied_curiosities():
 
 
 @pytest.mark.asyncio
-async def test_mind_without_store_says_off():
+async def test_mind_without_any_store_says_off():
+    # Both drives off → /mind explains there's nothing to show.
     reg = build_command_registry(curiosity_enabled=True)
-    reply = await reg.dispatch("mind", _ctx(curiosity=None))
-    assert "isn't switched on" in reply.lower()
+    reply = await reg.dispatch("mind", _ctx(curiosity=None, reflection=None))
+    assert "switched on" in reply.lower()
+    assert "nothing on my mind" in reply.lower()
 
 
 @pytest.mark.asyncio
@@ -374,4 +408,51 @@ async def test_forget_yes_without_curiosity_store_is_fine():
         "forget", _ctx(memory=mem, args="yes", curiosity=None)
     )
     assert mem.forgotten == ["EpeerD"]
+    assert "clean slate" in reply.lower()
+
+
+# --- reflection drive: /mind persona + /forget wiring ----------------------
+
+
+def test_mind_declared_when_only_reflection_enabled():
+    # Reflection alone is enough to surface /mind (curiosity off).
+    reg = build_command_registry(reflection_enabled=True)
+    assert reg.get("mind") is not None
+    assert "mind" in reg.names()
+
+
+@pytest.mark.asyncio
+async def test_mind_lists_facts_and_opinions():
+    store = FakeReflectionStore(
+        facts=[_Derived("Works as a backend developer")],
+        opinions=[_Derived("I like their blunt questions")],
+    )
+    reg = build_command_registry(reflection_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(reflection=store))
+    assert "on my mind" in reply.lower()
+    assert "what i know about you" in reply.lower()
+    assert "Works as a backend developer" in reply
+    assert "my own take" in reply.lower()
+    assert "I like their blunt questions" in reply
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_both_curiosity_and_reflection_when_present():
+    cur = FakeCuriosityStore(open_q=[_Cur("Road or MTB?")])
+    refl = FakeReflectionStore(facts=[_Derived("Rides a steel road bike")])
+    reg = build_command_registry(curiosity_enabled=True, reflection_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(curiosity=cur, reflection=refl))
+    assert "Road or MTB?" in reply
+    assert "Rides a steel road bike" in reply
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_reflection_store():
+    mem = FakeMemory()
+    refl = FakeReflectionStore(facts=[_Derived("a fact")])
+    reply = await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", reflection=refl)
+    )
+    assert mem.forgotten == ["EpeerD"]
+    assert refl.forgotten == ["EpeerD"]
     assert "clean slate" in reply.lower()

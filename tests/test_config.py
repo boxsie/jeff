@@ -308,6 +308,39 @@ def test_curiosity_overrides_parsed():
     assert cfg.curiosity_max_new_per_pass == 5
 
 
+def test_reflection_defaults_off():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.reflection_enabled is False
+    # Defaults mirror the deployed configmap so flipping the flag needs no other
+    # config change.
+    assert cfg.reflection_every_turns == 20
+    assert cfg.reflection_max_chars == 6000
+    assert cfg.reflection_max_items == 6
+    assert cfg.persona_max_chars == 2000
+    # Persona-aware distillation is on by default.
+    assert cfg.reflection_use_persona is True
+
+
+def test_reflection_overrides_parsed():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_REFLECTION_ENABLED": "true",
+            "JEFF_REFLECTION_EVERY_TURNS": "8",
+            "JEFF_REFLECTION_MAX_CHARS": "3000",
+            "JEFF_REFLECTION_MAX_ITEMS": "4",
+            "JEFF_REFLECTION_USE_PERSONA": "false",
+            "JEFF_PERSONA_MAX_CHARS": "1500",
+        }
+    )
+    assert cfg.reflection_enabled is True
+    assert cfg.reflection_every_turns == 8
+    assert cfg.reflection_max_chars == 3000
+    assert cfg.reflection_max_items == 4
+    assert cfg.reflection_use_persona is False
+    assert cfg.persona_max_chars == 1500
+
+
 def test_search_url_and_auth_parsed():
     cfg = Config.from_env(
         {

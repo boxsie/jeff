@@ -110,6 +110,33 @@ def _to_chat(messages: Iterable[Message]) -> list[dict]:
     return out
 
 
+def _render_persona(facts: Sequence[str], opinions: Sequence[str]) -> str:
+    """Render Jeff's distilled knowledge + self-formed opinions as a labelled
+    block for the system message. Returns "" when there's nothing to show.
+
+    These are Jeff's *own* distilled notes (not raw peer text), so they aren't
+    wrapped in <peer_message>. The block is **additive**: it colours how Jeff
+    responds but never overrides the operator-owned base prompt's character or
+    boundaries — that prompt stays the immutable anchor. Two subsections only
+    appear when their tier is non-empty.
+    """
+    if not facts and not opinions:
+        return ""
+    lines = [
+        "## What you've come to know",
+        "Things you've learned about them and views you've formed over your "
+        "conversations together. Let them colour how you respond — naturally, "
+        "don't recite them back.",
+    ]
+    if facts:
+        lines.append("About them:")
+        lines.extend(f"- {strip_chat_template_tokens(t)}" for t in facts)
+    if opinions:
+        lines.append("Your own take:")
+        lines.extend(f"- {strip_chat_template_tokens(t)}" for t in opinions)
+    return "\n".join(lines)
+
+
 def _render_curiosities(items: Sequence[str]) -> str:
     """Render Jeff's open questions as a labelled block for the system message.
     Returns "" when there's nothing to show.
@@ -165,16 +192,20 @@ async def build_history(
     recall_distance_max: float = DEFAULT_RECALL_DISTANCE_MAX,
     system_prompt: str = SYSTEM_PROMPT,
     curiosities: Sequence[str] = (),
+    facts: Sequence[str] = (),
+    opinions: Sequence[str] = (),
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
 
     Order: system → recalled-but-not-recent (chronological) → recent
     (chronological) → current user turn. Dedup keys on Message.id.
 
-    `curiosities` are Jeff's open questions (curiosity slice): when non-empty they
-    ride in the system message as a "## You're curious about" block, a sibling to
-    the recalled-memories block. Empty (the default, and whenever the feature is
-    off) → no block, so the system message is unchanged.
+    `curiosities` are Jeff's open questions (curiosity slice); `facts`/`opinions`
+    are Jeff's distilled persona (reflection slice). When non-empty they ride in
+    the system message as labelled blocks — the persona block first (standing
+    character), then recalled memories, then open curiosities. All empty (the
+    default, and whenever the features are off) → no blocks, so the system
+    message is unchanged.
     """
     # The incoming user_text comes straight off the wire — strip chat
     # template tokens before it lands in either the recall query (where
@@ -196,7 +227,15 @@ async def build_history(
     # the recent thread is the actual conversation. When there's nothing extra to
     # add, the system message is the prompt verbatim (preserves the operator's
     # exact prompt — and keeps the feature-off path byte-identical).
-    extra = [b for b in (_render_memories(older_recall), _render_curiosities(curiosities)) if b]
+    extra = [
+        b
+        for b in (
+            _render_persona(facts, opinions),
+            _render_memories(older_recall),
+            _render_curiosities(curiosities),
+        )
+        if b
+    ]
     system_content = (
         system_prompt.rstrip() + "\n\n" + "\n\n".join(extra) if extra else system_prompt
     )

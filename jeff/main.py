@@ -18,6 +18,7 @@ from .llm import make_chat_provider
 from .memory import Memory
 from .ollama import Ollama
 from .prompt import build_history, compose_system_prompt
+from .reflection import Reflector, ReflectionStore
 from .screen import screen_text
 from .searxng import SearxngClient
 from .tools import ToolRegistry, build_registry
@@ -45,6 +46,8 @@ async def handle_turn(
     system_prompt: str | None = None,
     curiosity_store: "CuriosityStore | None" = None,
     curiosity_driver: "CuriosityDriver | None" = None,
+    reflection_store: "ReflectionStore | None" = None,
+    reflector: "Reflector | None" = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -82,6 +85,20 @@ async def handle_turn(
             except Exception as e:
                 log.error("curiosity fetch failed peer=%s exc=%s", peer, type(e).__name__)
 
+        # Jeff's distilled persona for this peer — durable facts + first-person
+        # opinions — surfaced into the prompt's "## What you've come to know"
+        # block. Best-effort + additive: a store read fault must never break the
+        # reply, so fall back to no block.
+        facts: list[str] = []
+        opinions: list[str] = []
+        if reflection_store is not None:
+            try:
+                facts, opinions = await reflection_store.persona(
+                    peer, max_chars=cfg.persona_max_chars
+                )
+            except Exception as e:
+                log.error("persona fetch failed peer=%s exc=%s", peer, type(e).__name__)
+
         # Build the prompt BEFORE persisting the current user message.
         # build_history appends the current turn explicitly; if we stored it
         # first, recent()/recall() would also return it and the message would
@@ -96,6 +113,8 @@ async def handle_turn(
             recall_distance_max=cfg.recall_distance_max,
             system_prompt=system_prompt or cfg.system_prompt,
             curiosities=curiosities,
+            facts=facts,
+            opinions=opinions,
         )
         # Persist after building but before the model call, so the user turn is
         # still recorded even if the chat/tool call fails (matches prior behaviour).
@@ -111,6 +130,11 @@ async def handle_turn(
         # can't delay or break the turn that already sent its reply.
         if curiosity_driver is not None:
             await curiosity_driver.maybe_detect(peer, text, reply)
+        # Fire-and-forget: every N turns, consolidate the recent window into
+        # durable facts + opinions. maybe_reflect never blocks (spawns) and never
+        # raises, so it can't delay or break the turn that already sent its reply.
+        if reflector is not None:
+            await reflector.maybe_reflect(peer)
     except Exception as e:
         # Deliberately structured: don't log the exception message (it may
         # contain Ollama response body shaped by peer prompts — see
@@ -244,7 +268,10 @@ async def run(cfg: Config) -> None:
             # Built once; log enabled names (mirror the tools/prompt-source
             # startup lines). Disabled → declare nothing, receive nothing.
             commands = (
-                build_command_registry(curiosity_enabled=cfg.curiosity_enabled)
+                build_command_registry(
+                    curiosity_enabled=cfg.curiosity_enabled,
+                    reflection_enabled=cfg.reflection_enabled,
+                )
                 if cfg.commands_enabled
                 else None
             )
@@ -282,6 +309,29 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("curiosity disabled")
 
+            # Reflection / emergent personality (motivation slice 2) — default
+            # OFF. Built only when enabled so the disabled path makes no extra
+            # DB/LLM calls and stays byte-identical. The store shares the embed
+            # client/model/dim with memory; the reflector reads the episodic
+            # window from memory and runs the fire-and-forget consolidation pass.
+            reflection_store: ReflectionStore | None = None
+            reflector: Reflector | None = None
+            if cfg.reflection_enabled:
+                reflection_store = await ReflectionStore.create(
+                    pool,
+                    embed_client,
+                    embed_model=cfg.embed_model,
+                    embed_dim=cfg.embed_dim,
+                )
+                reflector = Reflector(reflection_store, memory, chat_provider, cfg)
+                log.info(
+                    "reflection enabled (consolidate every %d turn(s), persona cap %d chars)",
+                    cfg.reflection_every_turns,
+                    cfg.persona_max_chars,
+                )
+            else:
+                log.info("reflection disabled")
+
             client_kwargs: dict = {"socket_path": cfg.socket}
             if cfg.auth_seed_path:
                 client_kwargs["auth_seed"] = cfg.auth_seed_path
@@ -318,6 +368,8 @@ async def run(cfg: Config) -> None:
                             system_prompt,
                             curiosity_store,
                             curiosity_driver,
+                            reflection_store,
+                            reflector,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
@@ -332,6 +384,7 @@ async def run(cfg: Config) -> None:
                             system_prompt,
                             tuple(registry.names()),
                             curiosity_store,
+                            reflection_store,
                         ),
                         name="jeff-events",
                     )
@@ -349,6 +402,8 @@ async def run(cfg: Config) -> None:
                     await dispatcher.drain()
                     if curiosity_driver is not None:
                         await curiosity_driver.aclose()
+                    if reflector is not None:
+                        await reflector.aclose()
     finally:
         await pool.close()
 
@@ -362,6 +417,7 @@ async def _handle_command(
     system_prompt: str = "",
     tool_names: tuple[str, ...] = (),
     curiosity_store: "CuriosityStore | None" = None,
+    reflection_store: "ReflectionStore | None" = None,
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -383,6 +439,7 @@ async def _handle_command(
         system_prompt=system_prompt,
         tool_names=tool_names,
         curiosity=curiosity_store,
+        reflection=reflection_store,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -400,6 +457,7 @@ async def _drain_events(
     system_prompt: str = "",
     tool_names: tuple[str, ...] = (),
     curiosity_store: "CuriosityStore | None" = None,
+    reflection_store: "ReflectionStore | None" = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
@@ -423,6 +481,7 @@ async def _drain_events(
                 system_prompt,
                 tool_names,
                 curiosity_store,
+                reflection_store,
             )
             continue
         if not isinstance(event, ensemble.ChatMessage):
