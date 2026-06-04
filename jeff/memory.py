@@ -76,14 +76,12 @@ _DDL_IDX_EMBEDDING = sql.SQL(
     "ON messages USING hnsw (embedding vector_cosine_ops)"
 )
 
-# Per-peer control state. `history_cutoff` is the session watermark for the
-# `/clear` chat command (jeff ticket dc1791d5): BOTH `recent()` and `recall()`
-# only return rows newer than it, so `/clear` starts a genuinely fresh session
-# — the active window empties and semantic recall is scoped to the new session.
-# Pre-cutoff rows still exist (only `/forget` deletes); cross-session recall is
-# a deliberate future step. No embedding here, so it's a plain CREATE TABLE (no
-# env-derived dimension), but kept in the same idempotent psycopg.sql shape as
-# the rest.
+# Per-peer control state. `history_cutoff` is the thread watermark for the
+# `/clear` chat command (jeff ticket dc1791d5): ONLY `recent()` honours it, so
+# `/clear` starts a fresh conversational thread (the active window empties) while
+# long-term semantic `recall()` keeps spanning every session. Only `/forget`
+# deletes rows. No embedding here, so it's a plain CREATE TABLE (no env-derived
+# dimension), but kept in the same idempotent psycopg.sql shape as the rest.
 _DDL_PEER_STATE = sql.SQL(
     "CREATE TABLE IF NOT EXISTS peer_state ("
     "peer TEXT PRIMARY KEY, "
@@ -219,13 +217,11 @@ class Memory:
         *,
         distance_max: float = DEFAULT_RECALL_DISTANCE_MAX,
     ) -> list[Message]:
-        # Session scope: like recent(), recall now honours the per-peer
-        # history_cutoff, so `/clear` gives a genuinely fresh session —
-        # semantic recall no longer drags pre-clear lines back into context
-        # the moment a new message is topically similar. Rows older than the
-        # cutoff still exist (they're not deleted — that's /forget's job);
-        # they're simply out of reach until cross-session recall is added.
-        # COALESCE to -infinity so the no-cutoff case is unchanged.
+        # Session scope: recall deliberately spans ALL sessions and IGNORES the
+        # per-peer history_cutoff. Long-term semantic memory is meant to persist
+        # across `/clear` boundaries — `/clear` only resets the recent() thread,
+        # never long-term recall. Only `/forget` (hard delete) actually removes
+        # rows from recall's reach.
         #
         # W3 #dc9acd3c: pgvector "<=>" returns cosine *distance* (0 =
         # identical, 1 = orthogonal). Two reasons to floor it:
@@ -245,13 +241,10 @@ class Memory:
                 await cur.execute(
                     "SELECT id, peer, role, content, ts FROM messages "
                     "WHERE peer = %s "
-                    "  AND ts > COALESCE("
-                    "    (SELECT history_cutoff FROM peer_state WHERE peer = %s), "
-                    "    '-infinity'::timestamptz) "
                     "  AND (embedding <=> %s) <= %s "
                     "ORDER BY embedding <=> %s "
                     "LIMIT %s",
-                    (peer, peer, vec, distance_max, vec, k),
+                    (peer, vec, distance_max, vec, k),
                 )
                 rows = await cur.fetchall()
         return [
@@ -273,14 +266,14 @@ class Memory:
         limit: int = 8,
     ) -> list[tuple[Message, float]]:
         """Introspection view for `/debug recall`: the closest rows to `query`
-        with their cosine distances, honouring the session cutoff.
+        with their cosine distances.
 
-        Unlike recall(), this deliberately does NOT filter by distance_max — it
-        returns the top `limit` candidates ordered by distance so the operator
-        can see the near-misses just over the threshold (useful for tuning
-        DEFAULT_RECALL_DISTANCE_MAX). It still respects the cutoff, so it mirrors
-        the session scope a real turn would see. The caller decides which rows
-        the live recall() would actually have kept.
+        Mirrors recall()'s scope — spans ALL sessions (ignores the cutoff) — so
+        the debug view shows what a real turn would actually see. Unlike recall()
+        it does NOT filter by distance_max: it returns the top `limit` candidates
+        ordered by distance so the operator can see near-misses just over the
+        threshold (useful for tuning DEFAULT_RECALL_DISTANCE_MAX). The caller
+        decides which rows the live recall() would actually have kept.
         """
         emb = await self._embedder.embed(query, model=self._embed_model)
         vec = np.asarray(emb, dtype=np.float32)
@@ -291,12 +284,9 @@ class Memory:
                     "SELECT id, peer, role, content, ts, (embedding <=> %s) AS dist "
                     "FROM messages "
                     "WHERE peer = %s "
-                    "  AND ts > COALESCE("
-                    "    (SELECT history_cutoff FROM peer_state WHERE peer = %s), "
-                    "    '-infinity'::timestamptz) "
                     "ORDER BY embedding <=> %s "
                     "LIMIT %s",
-                    (vec, peer, peer, vec, limit),
+                    (vec, peer, vec, limit),
                 )
                 rows = await cur.fetchall()
         return [
@@ -314,11 +304,11 @@ class Memory:
         ]
 
     async def recent(self, peer: str, n: int = 10) -> list[Message]:
-        # Respect the session watermark: after `/clear` (set_history_cutoff),
-        # the conversational window only includes rows newer than the cutoff.
-        # COALESCE to -infinity when no cutoff is set so the unfiltered case is
-        # identical to before. recall() now applies the same filter, so a
-        # cleared session is fresh in both windows.
+        # Respect the thread watermark: after `/clear` (set_history_cutoff), the
+        # conversational window only includes rows newer than the cutoff, so the
+        # active thread starts fresh. COALESCE to -infinity when no cutoff is set.
+        # recall() deliberately does NOT honour the cutoff — long-term memory
+        # spans every session (so `/clear` resets the active thread only).
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -406,7 +396,7 @@ class Memory:
     async def get_history_cutoff(self, peer: str) -> datetime | None:
         """The peer's current session watermark, or None if never `/clear`-ed.
 
-        Read-only companion to set_history_cutoff, used by `/debug` to show where
+        Read-only counterpart to set_history_cutoff, used by `/debug` to show where
         the active session starts. None means the whole history is in scope.
         """
         async with self._pool.connection() as conn:

@@ -127,61 +127,44 @@ async def test_recall_scopes_by_peer(pool):
 
 
 @pytest.mark.asyncio
-async def test_clear_cutoff_scopes_both_recent_and_recall(pool):
-    """`/clear` semantics: set_history_cutoff starts a fresh session — it drops
-    older rows from BOTH the recent window and semantic recall, so pre-clear
-    lines can't bleed back in via topical similarity."""
+async def test_clear_resets_recent_thread_but_recall_spans_all_sessions(pool):
+    """`/clear` semantics: set_history_cutoff resets the recent THREAD only.
+    recall() still spans every session, so a query about a pre-clear topic can
+    still surface it (long-term memory persists across /clear)."""
     emb = FakeEmbedder()
     mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
 
-    # Pre-cutoff content the operator wants out of the active session.
-    await mem.remember("EabcD", "user", "I love cycling")
-    await mem.set_history_cutoff("EabcD")
-    # Post-cutoff content (the new conversation).
-    await mem.remember("EabcD", "user", "espresso every morning")
+    peer = "EthreadD"  # unique peer: the module pool is shared across tests
+    await mem.remember(peer, "user", "I love cycling")  # pre-clear
+    await mem.set_history_cutoff(peer)
+    await mem.remember(peer, "user", "espresso every morning")  # post-clear
 
-    recent = await mem.recent("EabcD", n=10)
+    # recent() is scoped to the fresh thread.
+    recent = await mem.recent(peer, n=10)
     assert [m.content for m in recent] == ["espresso every morning"]
 
-    # recall() now honours the cutoff: a query about the pre-clear topic finds
-    # nothing from before the cutoff (the row still exists, it's just out of
-    # this session's reach).
-    hits = await mem.recall("EabcD", "tell me about my bike", k=5)
-    assert all("cycling" not in m.content.lower() for m in hits)
-
-
-@pytest.mark.asyncio
-async def test_recall_finds_post_cutoff_rows(pool):
-    """The cutoff scopes recall to the current session, but still finds rows
-    created after the cutoff — a fresh session has working semantic memory."""
-    emb = FakeEmbedder()
-    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
-
-    await mem.set_history_cutoff("EabcD")
-    await mem.remember("EabcD", "user", "I love cycling")
-
-    hits = await mem.recall("EabcD", "tell me about my bike", k=5)
+    # recall() spans all sessions — the pre-clear topic is still reachable.
+    hits = await mem.recall(peer, "tell me about my bike", k=5)
     assert any("cycling" in m.content.lower() for m in hits)
 
 
 @pytest.mark.asyncio
-async def test_recall_scored_returns_distances_and_honours_cutoff(pool):
-    """`/debug recall` view: scored candidates ascend by distance and are scoped
-    to the current session (pre-cutoff rows are excluded, same as recall())."""
+async def test_recall_scored_returns_distances_spanning_sessions(pool):
+    """`/debug recall` view: mirrors recall() — spans all sessions (ignores the
+    cutoff), ascends by distance, returns floats."""
     emb = FakeEmbedder()
     mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
 
-    await mem.remember("EabcD", "user", "I love cycling")  # pre-cutoff
-    await mem.set_history_cutoff("EabcD")
-    await mem.remember("EabcD", "user", "espresso every morning")  # post-cutoff
+    peer = "EscoredD"
+    await mem.remember(peer, "user", "I love cycling")  # pre-cutoff
+    await mem.set_history_cutoff(peer)
+    await mem.remember(peer, "user", "espresso every morning")  # post-cutoff
 
-    scored = await mem.recall_scored("EabcD", "tell me about my bike", limit=8)
+    scored = await mem.recall_scored(peer, "tell me about my bike", limit=8)
 
     contents = [m.content.lower() for m, _ in scored]
-    # Pre-cutoff "cycling" is out of session scope even though it's the closest
-    # match to "bike"; only the post-cutoff row is a candidate.
-    assert all("cycling" not in c for c in contents)
-    assert any("espresso" in c for c in contents)
+    # Spans the cutoff: the pre-cutoff "cycling" is still a candidate.
+    assert any("cycling" in c for c in contents)
     dists = [d for _, d in scored]
     assert dists == sorted(dists)
     assert all(isinstance(d, float) for d in dists)

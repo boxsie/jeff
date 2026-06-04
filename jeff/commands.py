@@ -12,10 +12,11 @@ behaviour). That's why `/clear` works as one keystroke — the daemon's built-in
 clears the operator's local transcript while Jeff's `/clear` resets the working
 window of its memory. Jeff therefore declares only what it uniquely owns:
 
-  - `/clear`  — session reset: start a fresh session. Both the recent window
-                and semantic recall are scoped past the cutoff, so pre-clear
-                lines won't resurface this session (augments the daemon
-                transcript-clear). Nothing is deleted — that's `/forget`.
+  - `/clear`  — start a fresh conversational *thread*: resets the recent window
+                only. Long-term semantic recall still spans every session, so
+                older things can resurface naturally (Jeff remembers the whole
+                relationship). Augments the daemon transcript-clear; the hard
+                wipe is `/forget`.
   - `/forget` — hard wipe of everything Jeff remembers about this peer (confirm-gated).
   - `/stats`  — memory counts, uptime, active provider/model, prompt source.
   - `/debug`  — deterministic introspection: dump the real working context
@@ -155,20 +156,19 @@ class CommandRegistry:
 
 
 async def _cmd_clear(ctx: CommandContext) -> str:
-    """Session reset: start a fresh session by advancing the history cutoff.
-
-    Both the conversational window (`recent`) and semantic recall are scoped to
-    rows newer than the cutoff, so pre-clear lines won't bleed into the new
-    session. Nothing is deleted — the rows stay in the store for a future
-    cross-session recall feature; `/forget` is the hard wipe.
+    """Fresh conversational thread: advance the history cutoff, which resets the
+    `recent` window only. Long-term semantic recall deliberately keeps spanning
+    every session, so older things can still surface naturally — `/clear` resets
+    what we're actively talking about, not the whole relationship. `/forget` is
+    the hard wipe.
 
     This is the service leg of the daemon's `/clear` augment — the daemon clears
-    the operator's local transcript; this clears Jeff's working memory window."""
+    the operator's local transcript; this resets Jeff's active thread."""
     await ctx.memory.set_history_cutoff(ctx.peer)
     return (
-        "Started a fresh conversation — clean slate for this session. Your "
-        "earlier messages are still stored but I won't pull them into this "
-        "thread. Use `/forget` if you want them gone for good."
+        "Fresh conversation — I've reset what we're actively on, but I still "
+        "remember our history, so older stuff can come back up naturally. Use "
+        "`/forget` if you really want a clean slate."
     )
 
 
@@ -307,7 +307,7 @@ async def _debug_recall(ctx: CommandContext, query: str) -> str:
         f"kept by a real turn: ✓ = dist <= {threshold} and within recall_k={ctx.cfg.recall_k}",
     ]
     if not scored:
-        lines.append("(no candidates this session — nothing stored since the cutoff)")
+        lines.append("(no stored messages for this peer yet)")
     for i, (m, dist) in enumerate(scored):
         kept = dist <= threshold and i < ctx.cfg.recall_k
         mark = "✓" if kept else " "

@@ -284,7 +284,7 @@ async def test_debug_recall_no_candidates():
     reply = await build_command_registry().dispatch(
         "debug", _ctx(memory=mem, args="recall anything")
     )
-    assert "no candidates" in reply.lower()
+    assert "no stored messages" in reply.lower()
 
 
 @pytest.mark.asyncio
