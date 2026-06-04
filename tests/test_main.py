@@ -47,7 +47,7 @@ class FakeMemory:
         self.remembered.append((peer, role, content))
         return len(self.remembered)
 
-    async def recall(self, peer, query, k=5):
+    async def recall(self, peer, query, k=5, *, distance_max=0.55):
         return []
 
     async def recent(self, peer, n=10):

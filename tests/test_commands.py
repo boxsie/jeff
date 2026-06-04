@@ -254,20 +254,21 @@ async def test_debug_prompt_shows_full_effective_prompt():
 
 @pytest.mark.asyncio
 async def test_debug_recall_marks_kept_rows_with_distances():
-    # 0.18 and 0.37 are within the 0.4 threshold (kept ✓); 0.52 is over it.
+    # Default threshold is 0.55: 0.18 and 0.37 are kept (✓); 0.62 is over it.
     scored = [
         (_msg(84, "user", "espresso"), 0.18),
         (_msg(85, "assistant", "noted"), 0.37),
-        (_msg(50, "user", "cycling"), 0.52),
+        (_msg(50, "user", "cycling"), 0.62),
     ]
     mem = FakeMemory(scored=scored)
     reply = await build_command_registry().dispatch(
         "debug", _ctx(memory=mem, args="recall espresso morning")
     )
     assert "debug — recall" in reply
-    assert "0.180" in reply and "0.370" in reply and "0.520" in reply
-    assert "✓ 0.180" in reply          # within threshold → kept
-    assert "✓ 0.520" not in reply      # over threshold → not kept
+    assert "dist <= 0.55" in reply       # configured threshold shown
+    assert "0.180" in reply and "0.370" in reply and "0.620" in reply
+    assert "✓ 0.180" in reply            # within threshold → kept
+    assert "✓ 0.620" not in reply        # over threshold → not kept
     assert "#84" in reply and "#50" in reply
 
 

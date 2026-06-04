@@ -23,7 +23,7 @@ You need three things up:
 ```bash
 # 1. Pull the models
 ollama pull gemma3:12b-it-qat
-ollama pull nomic-embed-text
+ollama pull bge-m3
 
 # 2. Local Postgres with pgvector for dev
 docker run --rm -d --name jeff-pg -p 5432:5432 \
@@ -67,10 +67,11 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `XAI_BASE_URL` | `https://api.x.ai/v1` | xAI API base URL (OpenAI-compatible `/chat/completions`). |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama HTTP endpoint (always used for embeddings, regardless of chat provider) |
 | `OLLAMA_CHAT_MODEL` | `gemma3:12b-it-qat` | Chat model under the `ollama` provider (legacy; `JEFF_CHAT_MODEL` overrides it) |
-| `OLLAMA_EMBED_MODEL` | `nomic-embed-text` | Embedding model (embeddings stay local) |
-| `OLLAMA_EMBED_DIM` | `768` | Embedding vector dimensionality (must match the model) |
+| `OLLAMA_EMBED_MODEL` | `bge-m3` | Embedding model (embeddings stay local). `bge-m3` separates relevant from unrelated far better than `nomic-embed-text`. Changing this changes the vector dimension — run `python -m jeff reset-memory --yes` after switching. |
+| `OLLAMA_EMBED_DIM` | `1024` | Embedding vector dimensionality (must match the model: `bge-m3`=1024, `nomic-embed-text`=768). A mismatch with stored data fails loudly at startup. |
 | `MEMORY_RECALL_K` | `5` | How many semantically-similar past messages to retrieve per turn |
 | `MEMORY_RECENT_TURNS` | `10` | How many most-recent messages to include per turn |
+| `MEMORY_RECALL_DISTANCE` | `0.55` | Cosine-distance ceiling for recall (0..2; lower = stricter). Tuned for `bge-m3`; use ~0.4 for `nomic-embed-text`. Inspect live distances with the `/debug recall <query>` chat command. |
 | `JEFF_TOOLS_ENABLED` | `true` | Master switch for tool use. When off (or the registry is empty) the turn loop is byte-identical to the no-tools single-shot path. |
 | `JEFF_MAX_TOOL_ITERS` | `5` | Max provider↔tool round-trips per turn before a graceful "tool-use limit" reply. |
 | `JEFF_TOOL_TIMEOUT_S` | `30` | Per-tool execution timeout (seconds). A timed-out tool returns a safe error to the model; the turn survives. |

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-from .memory import Memory, Message
+from .memory import DEFAULT_RECALL_DISTANCE_MAX, Memory, Message
 from .screen import strip_chat_template_tokens
 
 
@@ -122,6 +122,7 @@ async def build_history(
     *,
     recent_turns: int,
     recall_k: int,
+    recall_distance_max: float = DEFAULT_RECALL_DISTANCE_MAX,
     system_prompt: str = SYSTEM_PROMPT,
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
@@ -134,7 +135,9 @@ async def build_history(
     # the embedder would otherwise hash them in) or the final user turn.
     user_text = strip_chat_template_tokens(user_text)
 
-    recalled = await memory.recall(peer, user_text, k=recall_k)
+    recalled = await memory.recall(
+        peer, user_text, k=recall_k, distance_max=recall_distance_max
+    )
     recent = await memory.recent(peer, n=recent_turns)
 
     # Recent wins on overlap (preserves natural chronological tail);

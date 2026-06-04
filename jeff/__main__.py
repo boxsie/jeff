@@ -2,6 +2,8 @@
 
 Subcommands (W3 #dc9acd3c):
     forget <peer-address>   delete every memory row for <peer-address>
+    reset-memory --yes      drop ALL memory and recreate the schema (used after
+                            an embedding-model/dimension change)
 """
 
 from __future__ import annotations
@@ -34,6 +36,18 @@ def run() -> None:
         asyncio.run(_forget(cfg, sys.argv[2]))
         return
 
+    if len(sys.argv) >= 2 and sys.argv[1] == "reset-memory":
+        if "--yes" not in sys.argv[2:]:
+            print(
+                "reset-memory DROPS all stored messages and cutoffs for every "
+                "peer (no undo).\nRe-run with --yes to confirm:\n"
+                "  python -m jeff reset-memory --yes",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        asyncio.run(_reset_memory(cfg))
+        return
+
     asyncio.run(_run(cfg))
 
 
@@ -56,6 +70,30 @@ async def _forget(cfg: Config, peer: str) -> None:
             )
             deleted = await memory.forget(peer)
             print(f"deleted {deleted} row(s) for peer={peer}")
+    finally:
+        await pool.close()
+
+
+async def _reset_memory(cfg: Config) -> None:
+    """Admin path: drop ALL memory and recreate the schema at the configured
+    embedding dimension. Used after switching embed models (e.g. nomic-768 ->
+    bge-m3-1024), where re-embedding old rows isn't wanted.
+    """
+    pool = AsyncConnectionPool(cfg.db_url, min_size=1, max_size=2, open=False)
+    await pool.open()
+    try:
+        async with Ollama(cfg.ollama_url) as ollama:
+            memory = Memory(
+                pool,
+                ollama,
+                embed_model=cfg.embed_model,
+                embed_dim=cfg.embed_dim,
+            )
+            await memory.reset()
+            print(
+                f"memory reset — schema recreated at dim={cfg.embed_dim} "
+                f"(model={cfg.embed_model})"
+            )
     finally:
         await pool.close()
 

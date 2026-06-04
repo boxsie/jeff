@@ -14,10 +14,11 @@ def test_from_env_defaults():
     assert cfg.name == "jeff"
     assert cfg.allowlist == []
     assert cfg.chat_model == "gemma3:12b-it-qat"
-    assert cfg.embed_model == "nomic-embed-text"
-    assert cfg.embed_dim == 768
+    assert cfg.embed_model == "bge-m3"
+    assert cfg.embed_dim == 1024
     assert cfg.recall_k == 5
     assert cfg.recent_turns == 10
+    assert cfg.recall_distance_max == 0.55
     assert cfg.socket == "/run/ensemble/sock"
     assert cfg.auth_seed_path is None
 
@@ -211,13 +212,23 @@ def test_from_env_overrides():
             "JEFF_NAME": "jeff-test",
             "MEMORY_RECALL_K": "3",
             "MEMORY_RECENT_TURNS": "4",
-            "OLLAMA_EMBED_DIM": "1024",
+            "OLLAMA_EMBED_DIM": "768",
+            "OLLAMA_EMBED_MODEL": "nomic-embed-text",
+            "MEMORY_RECALL_DISTANCE": "0.42",
         }
     )
     assert cfg.name == "jeff-test"
     assert cfg.recall_k == 3
     assert cfg.recent_turns == 4
-    assert cfg.embed_dim == 1024
+    assert cfg.embed_dim == 768
+    assert cfg.embed_model == "nomic-embed-text"
+    assert cfg.recall_distance_max == 0.42
+
+
+def test_recall_distance_rejects_out_of_range():
+    for bad in ("0", "-0.1", "2.1", "nope"):
+        with pytest.raises(ConfigError):
+            Config.from_env({"JEFF_DB_URL": "postgresql://x", "MEMORY_RECALL_DISTANCE": bad})
 
 
 def test_tools_defaults():

@@ -38,8 +38,6 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
-from .memory import DEFAULT_RECALL_DISTANCE_MAX
-
 if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     import ensemble
 
@@ -268,7 +266,7 @@ async def _debug_overview(ctx: CommandContext) -> str:
         + (_fmt_ts(cutoff) if cutoff else "(none — full history in window)"),
         f"stored msgs:    you={mine}  all peers={total}",
         f"knobs:          recent_turns={ctx.cfg.recent_turns}  recall_k={ctx.cfg.recall_k}"
-        f"  recall_dist<={DEFAULT_RECALL_DISTANCE_MAX}",
+        f"  recall_dist<={ctx.cfg.recall_distance_max}",
         f"system prompt:  {len(prompt)} chars  (source={ctx.cfg.system_prompt_source})",
         "tools:          " + (", ".join(ctx.tool_names) if ctx.tool_names else "(none)"),
         f"recent window ({len(recent)} / max {ctx.cfg.recent_turns}):",
@@ -300,17 +298,18 @@ async def _debug_recall(ctx: CommandContext, query: str) -> str:
     # visible (the whole point of a tuning view). The live recall() keeps the
     # first recall_k rows with dist <= DEFAULT_RECALL_DISTANCE_MAX; because rows
     # are distance-ordered, those are exactly the leading ✓ rows below.
+    threshold = ctx.cfg.recall_distance_max
     scored = await ctx.memory.recall_scored(
         ctx.peer, query, limit=ctx.cfg.recall_k + 3
     )
     lines = [
         f'query: "{_truncate(query, 80)}"',
-        f"kept by a real turn: ✓ = dist <= {DEFAULT_RECALL_DISTANCE_MAX} and within recall_k={ctx.cfg.recall_k}",
+        f"kept by a real turn: ✓ = dist <= {threshold} and within recall_k={ctx.cfg.recall_k}",
     ]
     if not scored:
         lines.append("(no candidates this session — nothing stored since the cutoff)")
     for i, (m, dist) in enumerate(scored):
-        kept = dist <= DEFAULT_RECALL_DISTANCE_MAX and i < ctx.cfg.recall_k
+        kept = dist <= threshold and i < ctx.cfg.recall_k
         mark = "✓" if kept else " "
         lines.append(f"{mark} {dist:.3f}  " + _fmt_msg_row("", m))
     body = "\n".join(lines)

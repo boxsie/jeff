@@ -48,10 +48,14 @@ class FakeMemory:
         self._recall = recall
         self._recent = recent
         self.recall_calls: list[tuple[str, str, int]] = []
+        self.recall_distance_calls: list[float] = []
         self.recent_calls: list[tuple[str, int]] = []
 
-    async def recall(self, peer: str, query: str, k: int = 5) -> list[Message]:
+    async def recall(
+        self, peer: str, query: str, k: int = 5, *, distance_max: float = 0.55
+    ) -> list[Message]:
         self.recall_calls.append((peer, query, k))
+        self.recall_distance_calls.append(distance_max)
         return self._recall
 
     async def recent(self, peer: str, n: int = 10) -> list[Message]:
@@ -131,6 +135,20 @@ async def test_build_history_shape_and_dedup():
     # Memory was queried with the right knobs.
     assert mem.recall_calls == [("EabcD", "Recommend gear", 5)]
     assert mem.recent_calls == [("EabcD", 10)]
+
+
+@pytest.mark.asyncio
+async def test_build_history_forwards_recall_distance():
+    mem = FakeMemory(recall=[], recent=[])
+    await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        recall_distance_max=0.42,
+    )
+    assert mem.recall_distance_calls == [0.42]
 
 
 @pytest.mark.asyncio

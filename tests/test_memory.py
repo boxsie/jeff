@@ -201,6 +201,39 @@ async def test_get_history_cutoff_roundtrip(pool):
 
 
 @pytest.mark.asyncio
+async def test_reset_wipes_all_peers_and_recreates(pool):
+    emb = FakeEmbedder()
+    mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    await mem.remember("EabcD", "user", "hello")
+    await mem.remember("EotherD", "user", "hi")
+    await mem.set_history_cutoff("EabcD")
+    assert await mem.total() >= 2
+
+    await mem.reset()
+
+    # Everything gone, schema intact and usable.
+    assert await mem.total() == 0
+    assert await mem.get_history_cutoff("EabcD") is None
+    await mem.remember("EabcD", "user", "starting over")
+    assert await mem.count("EabcD") == 1
+
+
+@pytest.mark.asyncio
+async def test_init_schema_rejects_embed_dim_mismatch(pool):
+    """Switching embed models (dim change) without a reset must fail loudly at
+    startup, not silently break every insert later."""
+    emb = FakeEmbedder()
+    # Establish the table at the fake embedder's dim (idempotent if it exists).
+    await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)
+
+    with pytest.raises(ValueError, match="reset-memory"):
+        await Memory.create(
+            pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM + 4
+        )
+
+
+@pytest.mark.asyncio
 async def test_forget_hard_deletes_and_clears_watermark(pool):
     emb = FakeEmbedder()
     mem = await Memory.create(pool, emb, embed_model="fake", embed_dim=FakeEmbedder.DIM)

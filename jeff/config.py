@@ -120,6 +120,25 @@ def _parse_safesearch(raw: str) -> int:
     return n
 
 
+# Cosine *distance* ceiling for recall (pgvector "<=>" ranges 0..2; 0 = identical,
+# 1 = orthogonal). Default 0.55 is tuned for bge-m3, which cleanly separates
+# relevant (~0.4-0.52) from unrelated (~0.7); the old 0.4 with nomic-embed-text
+# dropped almost everything. Operator-tunable per embed model, so a bad value
+# fails fast at load.
+def _parse_recall_distance(raw: str) -> float:
+    try:
+        n = float(raw)
+    except ValueError as e:
+        raise ConfigError(
+            f"MEMORY_RECALL_DISTANCE must be a number; got {raw!r}"
+        ) from e
+    if not (0.0 < n <= 2.0):
+        raise ConfigError(
+            f"MEMORY_RECALL_DISTANCE out of range: {n} (allowed 0 < x <= 2)"
+        )
+    return n
+
+
 def _parse_bool(raw: str | None) -> bool:
     """Parse a permissive boolean env value. Anything truthy-looking is True."""
     if raw is None:
@@ -158,6 +177,7 @@ class Config:
 
     recall_k: int
     recent_turns: int
+    recall_distance_max: float
 
     tools_enabled: bool
     max_tool_iters: int
@@ -233,8 +253,8 @@ class Config:
             llm_provider=provider,
             ollama_url=e.get("OLLAMA_URL", "http://localhost:11434"),
             chat_model=chat_model,
-            embed_model=e.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
-            embed_dim=_parse_embed_dim(e.get("OLLAMA_EMBED_DIM", "768")),
+            embed_model=e.get("OLLAMA_EMBED_MODEL", "bge-m3"),
+            embed_dim=_parse_embed_dim(e.get("OLLAMA_EMBED_DIM", "1024")),
             xai_api_key=xai_api_key,
             xai_base_url=e.get("XAI_BASE_URL", "https://api.x.ai/v1"),
             system_prompt=system_prompt,
@@ -242,6 +262,9 @@ class Config:
             db_url=db_url,
             recall_k=int(e.get("MEMORY_RECALL_K", "5")),
             recent_turns=int(e.get("MEMORY_RECENT_TURNS", "10")),
+            recall_distance_max=_parse_recall_distance(
+                e.get("MEMORY_RECALL_DISTANCE", "0.55")
+            ),
             tools_enabled=_parse_bool(e.get("JEFF_TOOLS_ENABLED", "true")),
             max_tool_iters=int(e.get("JEFF_MAX_TOOL_ITERS", "5")),
             tool_timeout_s=float(e.get("JEFF_TOOL_TIMEOUT_S", "30")),

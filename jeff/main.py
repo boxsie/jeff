@@ -77,6 +77,7 @@ async def handle_turn(
             text,
             recent_turns=cfg.recent_turns,
             recall_k=cfg.recall_k,
+            recall_distance_max=cfg.recall_distance_max,
             system_prompt=system_prompt or cfg.system_prompt,
         )
         # Persist after building but before the model call, so the user turn is

@@ -7,6 +7,7 @@ pool per process; embeddings come from Ollama via the provided client.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -32,9 +33,11 @@ MAX_CONTENT_BYTES = 65536
 
 # Default cosine-distance ceiling for recall(). A row further than this from the
 # query isn't relevant enough to feed the model (see recall() for the rationale).
-# Factored out as a module constant so the turn path and the /debug recall view
-# mark the same threshold instead of hard-coding 0.4 in two places.
-DEFAULT_RECALL_DISTANCE_MAX = 0.4
+# Tuned for bge-m3 (the default embed model), which separates relevant (~0.4-0.52)
+# from unrelated (~0.7) cleanly. The runtime value is config-driven
+# (MEMORY_RECALL_DISTANCE); this constant is the shared default for direct callers
+# and tests. Keep in sync with config._parse_recall_distance's default.
+DEFAULT_RECALL_DISTANCE_MAX = 0.55
 
 
 @dataclass(frozen=True)
@@ -131,12 +134,40 @@ class Memory:
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL_EXTENSION)
+                await self._guard_embed_dim(cur)
                 await cur.execute(table_ddl)
                 await cur.execute(_DDL_IDX_PEER_TS)
                 await cur.execute(_DDL_IDX_EMBEDDING)
                 await cur.execute(_DDL_PEER_STATE)
             await conn.commit()
             await register_vector_async(conn)
+
+    async def _guard_embed_dim(self, cur) -> None:
+        # If `messages` already exists at a different embedding dimension (e.g.
+        # the operator switched embed models), CREATE TABLE IF NOT EXISTS is a
+        # no-op and every later insert would fail on a dim mismatch — silently,
+        # inside the per-turn except. Detect it here and fail loudly with the fix
+        # rather than letting memory quietly break.
+        await cur.execute("SELECT to_regclass('messages')")
+        row = await cur.fetchone()
+        if row is None or row[0] is None:
+            return  # fresh database — nothing to compare against
+        await cur.execute(
+            "SELECT format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_attribute a "
+            "WHERE a.attrelid = 'messages'::regclass AND a.attname = 'embedding'"
+        )
+        ftrow = await cur.fetchone()
+        if not ftrow or not ftrow[0]:
+            return
+        m = re.search(r"\((\d+)\)", ftrow[0])  # e.g. 'vector(768)' -> 768
+        existing_dim = int(m.group(1)) if m else None
+        if existing_dim is not None and existing_dim != self._embed_dim:
+            raise ValueError(
+                f"stored embedding dimension {existing_dim} != configured "
+                f"{self._embed_dim} (OLLAMA_EMBED_DIM). The embedding model "
+                "changed; run `python -m jeff reset-memory --yes` to start fresh."
+            )
 
     async def _connection(self):
         # psycopg_pool reuses connections, so register the vector adapter on
@@ -339,6 +370,21 @@ class Memory:
                 )
             await conn.commit()
         return int(deleted)
+
+    async def reset(self) -> None:
+        """Destructive fresh start: drop ALL messages and per-peer cutoffs, then
+        recreate the schema at the configured embedding dimension.
+
+        This is the operator's path when the embedding model/dimension changes
+        and re-embedding old rows isn't wanted (`python -m jeff reset-memory`).
+        Wipes every peer, unlike forget() which is scoped to one.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("DROP TABLE IF EXISTS messages")
+                await cur.execute("DROP TABLE IF EXISTS peer_state")
+            await conn.commit()
+        await self._init_schema()
 
     async def set_history_cutoff(self, peer: str) -> None:
         """Soft reset for `/new`: mark now() as this peer's history watermark.
