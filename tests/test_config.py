@@ -284,6 +284,30 @@ def test_commands_can_be_disabled():
     assert cfg.commands_enabled is False
 
 
+def test_curiosity_defaults_off():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.curiosity_enabled is False
+    assert cfg.curiosity_every_turns == 1
+    assert cfg.curiosity_max_open == 6
+    assert cfg.curiosity_max_new_per_pass == 3
+
+
+def test_curiosity_overrides_parsed():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_CURIOSITY_ENABLED": "true",
+            "JEFF_CURIOSITY_EVERY_TURNS": "3",
+            "JEFF_CURIOSITY_MAX_OPEN": "10",
+            "JEFF_CURIOSITY_MAX_NEW": "5",
+        }
+    )
+    assert cfg.curiosity_enabled is True
+    assert cfg.curiosity_every_turns == 3
+    assert cfg.curiosity_max_open == 10
+    assert cfg.curiosity_max_new_per_pass == 5
+
+
 def test_search_url_and_auth_parsed():
     cfg = Config.from_env(
         {

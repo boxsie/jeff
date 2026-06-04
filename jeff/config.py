@@ -190,6 +190,11 @@ class Config:
 
     commands_enabled: bool
 
+    curiosity_enabled: bool
+    curiosity_every_turns: int
+    curiosity_max_open: int
+    curiosity_max_new_per_pass: int
+
     max_inflight: int
     per_peer_concurrency: int
     peer_rate_per_minute: float
@@ -273,6 +278,12 @@ class Config:
             searxng_auth=e.get("JEFF_SEARXNG_AUTH") or None,
             search_safesearch=_parse_safesearch(e.get("JEFF_SEARCH_SAFESEARCH", "0")),
             commands_enabled=_parse_bool(e.get("JEFF_COMMANDS_ENABLED", "true")),
+            # Curiosity drive (motivation-system slice 1) — default OFF: when off
+            # the store/driver are never built, so behaviour is byte-identical.
+            curiosity_enabled=_parse_bool(e.get("JEFF_CURIOSITY_ENABLED", "false")),
+            curiosity_every_turns=int(e.get("JEFF_CURIOSITY_EVERY_TURNS", "1")),
+            curiosity_max_open=int(e.get("JEFF_CURIOSITY_MAX_OPEN", "6")),
+            curiosity_max_new_per_pass=int(e.get("JEFF_CURIOSITY_MAX_NEW", "3")),
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),

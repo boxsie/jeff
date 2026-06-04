@@ -218,6 +218,96 @@ async def test_tools_disabled_uses_single_shot_chat_path():
     assert len(ollama.chat_calls) == 1
 
 
+class _FakeCuriosity:
+    """A stored open question with just the field handle_turn reads."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+
+class FakeCuriosityStore:
+    def __init__(self, open_texts: list[str] | None = None, *, boom: bool = False):
+        self._open = [_FakeCuriosity(t) for t in (open_texts or [])]
+        self._boom = boom
+        self.open_calls: list[tuple[str, int]] = []
+
+    async def open_curiosities(self, peer, *, limit=10):
+        self.open_calls.append((peer, limit))
+        if self._boom:
+            raise RuntimeError("DSN=postgresql://secret store down")
+        return self._open[:limit]
+
+
+class FakeCuriosityDriver:
+    def __init__(self):
+        self.detect_calls: list[tuple[str, str, str]] = []
+
+    async def maybe_detect(self, peer, user_text, assistant_text):
+        self.detect_calls.append((peer, user_text, assistant_text))
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_injects_open_curiosities_and_fires_detection():
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="sure")
+    memory = FakeMemory()
+    store = FakeCuriosityStore(["What's your homelab called?"])
+    driver = FakeCuriosityDriver()
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "hey",
+        None, None, store, driver,
+    )
+
+    # The open question rode into the system message as a curiosity block.
+    system = ollama.chat_calls[0][0]
+    assert system["role"] == "system"
+    assert "## You're curious about" in system["content"]
+    assert "What's your homelab called?" in system["content"]
+    # Detection fired with the actual exchange (user text + the reply sent).
+    assert driver.detect_calls == [("EpeerD", "hey", "sure")]
+    assert store.open_calls == [("EpeerD", cfg.curiosity_max_open)]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_survives_curiosity_store_read_fault():
+    """Curiosity is additive: a store read fault must not break the reply or
+    leak DSN/exception text — the turn proceeds with no curiosity block."""
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="still here")
+    memory = FakeMemory()
+    store = FakeCuriosityStore(boom=True)
+    driver = FakeCuriosityDriver()
+    cfg = _cfg()
+
+    await handle_turn(
+        handle, memory, ollama, cfg, "EpeerD", "hey",
+        None, None, store, driver,
+    )
+
+    # Reply still sent + stored despite the store blowing up.
+    assert handle.sent == [("EpeerD", "still here")]
+    system = ollama.chat_calls[0][0]
+    assert "## You're curious about" not in system["content"]
+    # Detection still fires for the completed exchange.
+    assert driver.detect_calls == [("EpeerD", "hey", "still here")]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_without_curiosity_makes_no_curiosity_calls():
+    """Flag-off parity: no store/driver → no curiosity block, byte-identical."""
+    handle = FakeHandle()
+    ollama = FakeOllama(reply="ok")
+    memory = FakeMemory()
+    cfg = _cfg()
+
+    await handle_turn(handle, memory, ollama, cfg, "EpeerD", "hey")
+
+    system = ollama.chat_calls[0][0]
+    assert "## You're curious about" not in system["content"]
+
+
 @pytest.mark.asyncio
 async def test_handle_turn_uses_passed_system_prompt():
     handle = FakeHandle()

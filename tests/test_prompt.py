@@ -173,6 +173,61 @@ async def test_build_history_empty_memory():
     ]
 
 
+@pytest.mark.asyncio
+async def test_build_history_injects_curiosity_block_when_present():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        curiosities=["What's your homelab called?", "Road or MTB?"],
+    )
+    sys_msg = history[0]
+    assert sys_msg["role"] == "system"
+    assert sys_msg["content"].startswith(SYSTEM_PROMPT)
+    assert "## You're curious about" in sys_msg["content"]
+    assert "- What's your homelab called?" in sys_msg["content"]
+    assert "- Road or MTB?" in sys_msg["content"]
+    # Curiosities are Jeff's own questions — NOT wrapped as untrusted peer text.
+    assert "<peer_message>What's your homelab called?" not in sys_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_build_history_no_curiosity_block_when_empty():
+    # Empty curiosities (the default, and whenever the drive is off) → the system
+    # message is the prompt verbatim, byte-identical to before the feature.
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        curiosities=[],
+    )
+    assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert "## You're curious about" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_build_history_memories_and_curiosities_coexist():
+    recall = [_msg(1, "user", "I love cycling", mins_ago=120)]
+    mem = FakeMemory(recall, [])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        curiosities=["Road or MTB?"],
+    )
+    content = history[0]["content"]
+    assert "## Things you remember" in content
+    assert "## You're curious about" in content
+
+
 # W3 #dc9acd3c: SYSTEM_PROMPT must survive a turn whose recall contains a
 # "ignore previous instructions" string. We don't test LLM behavior here —
 # only that the assembled messages list still has the system prompt as the

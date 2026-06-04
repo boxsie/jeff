@@ -110,6 +110,25 @@ def _to_chat(messages: Iterable[Message]) -> list[dict]:
     return out
 
 
+def _render_curiosities(items: Sequence[str]) -> str:
+    """Render Jeff's open questions as a labelled block for the system message.
+    Returns "" when there's nothing to show.
+
+    These are Jeff's *own* self-authored questions (not peer text), so they are
+    not wrapped in <peer_message>. They're surfaced so Jeff can raise one
+    naturally when the moment fits — not interrogate or list them out.
+    """
+    if not items:
+        return ""
+    lines = [
+        "## You're curious about",
+        "Open questions you've been wanting to ask them. Bring one up naturally "
+        "if the moment fits — don't interrogate them or read these back as a list.",
+    ]
+    lines.extend(f"- {strip_chat_template_tokens(t)}" for t in items)
+    return "\n".join(lines)
+
+
 def _render_memories(older: list[Message]) -> str:
     """Render cross-thread recalled memories as a labelled block for the system
     message. Returns "" when there's nothing to show.
@@ -145,11 +164,17 @@ async def build_history(
     recall_k: int,
     recall_distance_max: float = DEFAULT_RECALL_DISTANCE_MAX,
     system_prompt: str = SYSTEM_PROMPT,
+    curiosities: Sequence[str] = (),
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
 
     Order: system → recalled-but-not-recent (chronological) → recent
     (chronological) → current user turn. Dedup keys on Message.id.
+
+    `curiosities` are Jeff's open questions (curiosity slice): when non-empty they
+    ride in the system message as a "## You're curious about" block, a sibling to
+    the recalled-memories block. Empty (the default, and whenever the feature is
+    off) → no block, so the system message is unchanged.
     """
     # The incoming user_text comes straight off the wire — strip chat
     # template tokens before it lands in either the recall query (where
@@ -167,12 +192,13 @@ async def build_history(
     recent_ids = {m.id for m in recent}
     older_recall = [m for m in recalled if m.id not in recent_ids]
 
-    # Memories ride in the system message (a labelled block); the recent thread
-    # is the actual conversation. When there's nothing recalled, the system
-    # message is the prompt verbatim (preserves the operator's exact prompt).
-    memories = _render_memories(older_recall)
+    # Memories + open curiosities ride in the system message as labelled blocks;
+    # the recent thread is the actual conversation. When there's nothing extra to
+    # add, the system message is the prompt verbatim (preserves the operator's
+    # exact prompt — and keeps the feature-off path byte-identical).
+    extra = [b for b in (_render_memories(older_recall), _render_curiosities(curiosities)) if b]
     system_content = (
-        f"{system_prompt.rstrip()}\n\n{memories}" if memories else system_prompt
+        system_prompt.rstrip() + "\n\n" + "\n\n".join(extra) if extra else system_prompt
     )
 
     history: list[dict] = [{"role": "system", "content": system_content}]

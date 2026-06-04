@@ -14,6 +14,7 @@ import sys
 from psycopg_pool import AsyncConnectionPool
 
 from .config import Config, ConfigError
+from .curiosity import CuriosityStore
 from .main import run as _run
 from .memory import Memory
 from .ollama import Ollama
@@ -90,9 +91,18 @@ async def _reset_memory(cfg: Config) -> None:
                 embed_dim=cfg.embed_dim,
             )
             await memory.reset()
+            # Same embed dim drives the curiosity store, so a dimension change
+            # invalidates it too — recreate it alongside messages.
+            curiosity = CuriosityStore(
+                pool,
+                ollama,
+                embed_model=cfg.embed_model,
+                embed_dim=cfg.embed_dim,
+            )
+            await curiosity.reset()
             print(
-                f"memory reset — schema recreated at dim={cfg.embed_dim} "
-                f"(model={cfg.embed_model})"
+                f"memory reset — messages + curiosities schema recreated at "
+                f"dim={cfg.embed_dim} (model={cfg.embed_model})"
             )
     finally:
         await pool.close()

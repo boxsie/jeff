@@ -86,7 +86,33 @@ def _cfg(**extra) -> Config:
     return Config.from_env(env)
 
 
-def _ctx(memory=None, args="", cfg=None, system_prompt="", tool_names=()) -> CommandContext:
+class FakeCuriosityStore:
+    """Records curiosity mutations for the /forget + /mind command paths."""
+
+    def __init__(self, open_q=None, satisfied=None):
+        self._open = open_q or []
+        self._satisfied = satisfied or []
+        self.forgotten: list[str] = []
+
+    async def open_curiosities(self, peer, *, limit=10):
+        return self._open[:limit]
+
+    async def recently_satisfied(self, peer, *, limit=10):
+        return self._satisfied[:limit]
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return len(self._open) + len(self._satisfied)
+
+
+class _Cur:
+    def __init__(self, text: str):
+        self.text = text
+
+
+def _ctx(
+    memory=None, args="", cfg=None, system_prompt="", tool_names=(), curiosity=None
+) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
         memory=memory or FakeMemory(),
@@ -95,6 +121,7 @@ def _ctx(memory=None, args="", cfg=None, system_prompt="", tool_names=()) -> Com
         args=args,
         system_prompt=system_prompt,
         tool_names=tool_names,
+        curiosity=curiosity,
     )
 
 
@@ -291,3 +318,60 @@ async def test_debug_recall_no_candidates():
 async def test_debug_unknown_subcommand_hints():
     reply = await build_command_registry().dispatch("debug", _ctx(args="wibble"))
     assert "unknown debug view" in reply.lower()
+
+
+# --- curiosity drive: /mind + /forget wiring -------------------------------
+
+
+def test_mind_declared_only_when_curiosity_enabled():
+    # Default (off) → no /mind, so the declared set is unchanged.
+    assert build_command_registry().get("mind") is None
+    assert "mind" not in build_command_registry().names()
+    # Enabled → /mind appears.
+    reg = build_command_registry(curiosity_enabled=True)
+    assert reg.get("mind") is not None
+    assert "mind" in reg.names()
+
+
+@pytest.mark.asyncio
+async def test_mind_lists_open_and_satisfied_curiosities():
+    store = FakeCuriosityStore(
+        open_q=[_Cur("What's your homelab called?"), _Cur("Road or MTB?")],
+        satisfied=[_Cur("Where do you live?")],
+    )
+    reg = build_command_registry(curiosity_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(curiosity=store))
+    assert "on my mind" in reply.lower()
+    assert "What's your homelab called?" in reply
+    assert "Road or MTB?" in reply
+    assert "recently answered" in reply.lower()
+    assert "Where do you live?" in reply
+
+
+@pytest.mark.asyncio
+async def test_mind_without_store_says_off():
+    reg = build_command_registry(curiosity_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(curiosity=None))
+    assert "isn't switched on" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_curiosity_store():
+    mem = FakeMemory()
+    store = FakeCuriosityStore(open_q=[_Cur("anything?")])
+    reply = await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", curiosity=store)
+    )
+    assert mem.forgotten == ["EpeerD"]
+    assert store.forgotten == ["EpeerD"]
+    assert "clean slate" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_without_curiosity_store_is_fine():
+    mem = FakeMemory()
+    reply = await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", curiosity=None)
+    )
+    assert mem.forgotten == ["EpeerD"]
+    assert "clean slate" in reply.lower()

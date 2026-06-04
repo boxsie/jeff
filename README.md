@@ -80,6 +80,10 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_SEARXNG_AUTH` | _none_ | Optional full `Authorization` header value if the SearXNG instance requires auth (e.g. `Basic …` / `Bearer …`). Never logged. |
 | `JEFF_SEARCH_SAFESEARCH` | `0` | Safe-search level stamped on every query: `0` off, `1` moderate, `2` strict. Off by default. A bad value fails fast at load. |
 | `JEFF_COMMANDS_ENABLED` | `true` | Whether Jeff declares its slash-commands (`/clear`, `/forget`, `/stats`) to the daemon at registration. When off, Jeff declares none and the daemon routes no command invocations to it. |
+| `JEFF_CURIOSITY_ENABLED` | `false` | Curiosity drive: after a turn, a fire-and-forget pass distils open questions Jeff genuinely wants to ask, surfaces them in the prompt, and marks them answered when you reply. Off ⇒ no extra store/LLM calls (byte-identical to today). Adds the `/mind` command. |
+| `JEFF_CURIOSITY_EVERY_TURNS` | `1` | Run the curiosity detection pass every N turns per peer (throttle the extra LLM call). |
+| `JEFF_CURIOSITY_MAX_OPEN` | `6` | Cap on how many open questions are injected into the prompt's "You're curious about" block. |
+| `JEFF_CURIOSITY_MAX_NEW` | `3` | Cap on new questions stored per detection pass. |
 
 ## Commands
 
@@ -100,6 +104,8 @@ clears your local transcript while Jeff's leg resets its working memory window.
 | `/clear` | **Session reset** — drops the active thread from Jeff's recent window while keeping long-term semantic memory (older facts can still resurface via recall). Augments the daemon's built-in transcript clear. |
 | `/forget` | **Hard wipe** — permanently deletes every stored message for you. Irreversible, so it's confirm-gated: send `/forget yes` to actually wipe. Jeff-only; no daemon counterpart. |
 | `/stats` | Stored-message counts (you + all peers), process uptime, active provider/model, and system-prompt source. No secrets. |
+| `/debug` | Deterministic introspection of Jeff's working context: effective system prompt, session cutoff, recent window, and what recall would surface (with cosine distances). `/debug prompt` and `/debug recall <query>` for the detail views. |
+| `/mind` | What Jeff is curious about: open questions it wants to ask you, plus recently answered ones. Only declared when `JEFF_CURIOSITY_ENABLED` is on. |
 
 `/help` and `/whoami` are the daemon's built-ins (it aggregates every service's
 commands and reports node identity) — Jeff no longer declares them.

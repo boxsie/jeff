@@ -43,6 +43,7 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     import ensemble
 
     from .config import Config
+    from .curiosity import CuriosityStore
     from .memory import Memory, Message
 
 
@@ -66,8 +67,10 @@ class CommandContext:
     `system_prompt` is the *effective* prompt actually sent on a turn (operator
     base + capabilities addendum), composed once at startup; `tool_names` is the
     registered tool set. Both are here so `/debug` can show the real working
-    context rather than reconstructing it. They default to empty so callers that
-    don't care (and older tests) need not supply them.
+    context rather than reconstructing it. `curiosity` is the open-questions store
+    (None when the curiosity drive is off) so `/mind` can show it and `/forget`
+    can wipe it. They default to empty/None so callers that don't care (and older
+    tests) need not supply them.
     """
 
     handle: "ensemble.ServiceHandle"
@@ -77,6 +80,7 @@ class CommandContext:
     args: str
     system_prompt: str = ""
     tool_names: tuple[str, ...] = ()
+    curiosity: "CuriosityStore | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -186,6 +190,10 @@ async def _cmd_forget(ctx: CommandContext) -> str:
             "conversations — there's no undo. If you're sure, send `/forget yes`."
         )
     deleted = await ctx.memory.forget(ctx.peer)
+    # Wipe the curiosity store too (when the drive is on) so a clean slate really
+    # is clean — open questions are derived from the same conversations.
+    if ctx.curiosity is not None:
+        await ctx.curiosity.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -342,28 +350,59 @@ async def _cmd_debug(ctx: CommandContext) -> str:
     )
 
 
-def build_command_registry() -> CommandRegistry:
+# --- /mind: the curiosity drive's introspection view ----------------------
+
+
+async def _cmd_mind(ctx: CommandContext) -> str:
+    """Show what's on Jeff's mind: open questions it wants to ask, and the most
+    recently answered ones. Deterministic dump (no model call), sibling to
+    `/debug`. Only declared when the curiosity drive is enabled."""
+    if ctx.curiosity is None:
+        return "Curiosity isn't switched on right now, so there's nothing on my mind to show."
+    open_cur = await ctx.curiosity.open_curiosities(ctx.peer, limit=20)
+    satisfied = await ctx.curiosity.recently_satisfied(ctx.peer, limit=5)
+
+    lines = [f"open questions ({len(open_cur)}):"]
+    if open_cur:
+        lines.extend(f"  • {_truncate(c.text)}" for c in open_cur)
+    else:
+        lines.append("  (nothing yet — I get curious as we talk)")
+    if satisfied:
+        lines.append(f"recently answered ({len(satisfied)}):")
+        lines.extend(f"  ✓ {_truncate(c.text)}" for c in satisfied)
+
+    body = "\n".join(lines)
+    return "**on my mind**\n```\n" + body + "\n```"
+
+
+def build_command_registry(*, curiosity_enabled: bool = False) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
-    daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`."""
-    return CommandRegistry(
-        [
-            Command(
-                "clear",
-                "start a fresh conversation (keeps long-term memory)",
-                _cmd_clear,
-            ),
-            Command(
-                "forget",
-                "permanently wipe everything I remember",
-                _cmd_forget,
-                usage="yes",
-            ),
-            Command("stats", "memory counts, uptime, and active model", _cmd_stats),
-            Command(
-                "debug",
-                "inspect my working context (prompt, recent window, recall)",
-                _cmd_debug,
-                usage="[prompt|recall <query>]",
-            ),
-        ]
-    )
+    daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
+
+    `/mind` is declared only when the curiosity drive is on — keeping the
+    feature-off path's declared command set unchanged."""
+    cmds = [
+        Command(
+            "clear",
+            "start a fresh conversation (keeps long-term memory)",
+            _cmd_clear,
+        ),
+        Command(
+            "forget",
+            "permanently wipe everything I remember",
+            _cmd_forget,
+            usage="yes",
+        ),
+        Command("stats", "memory counts, uptime, and active model", _cmd_stats),
+        Command(
+            "debug",
+            "inspect my working context (prompt, recent window, recall)",
+            _cmd_debug,
+            usage="[prompt|recall <query>]",
+        ),
+    ]
+    if curiosity_enabled:
+        cmds.append(
+            Command("mind", "show what I'm curious about right now", _cmd_mind)
+        )
+    return CommandRegistry(cmds)

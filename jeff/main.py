@@ -11,6 +11,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from .commands import CommandContext, CommandRegistry, build_command_registry
 from .config import Config
+from .curiosity import CuriosityDriver, CuriosityStore
 from .dispatch import DispatchPolicy, TurnDispatcher
 from .llm import ChatProvider, ChatResult
 from .llm import make_chat_provider
@@ -42,6 +43,8 @@ async def handle_turn(
     text: str,
     registry: ToolRegistry | None = None,
     system_prompt: str | None = None,
+    curiosity_store: "CuriosityStore | None" = None,
+    curiosity_driver: "CuriosityDriver | None" = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -66,6 +69,19 @@ async def handle_turn(
     don't pollute recall.
     """
     try:
+        # Jeff's open questions for this peer, surfaced into the prompt's
+        # "## You're curious about" block. Best-effort: curiosity is additive, so
+        # a store read fault must never break the reply — fall back to no block.
+        curiosities: list[str] = []
+        if curiosity_store is not None:
+            try:
+                open_cur = await curiosity_store.open_curiosities(
+                    peer, limit=cfg.curiosity_max_open
+                )
+                curiosities = [c.text for c in open_cur]
+            except Exception as e:
+                log.error("curiosity fetch failed peer=%s exc=%s", peer, type(e).__name__)
+
         # Build the prompt BEFORE persisting the current user message.
         # build_history appends the current turn explicitly; if we stored it
         # first, recent()/recall() would also return it and the message would
@@ -79,6 +95,7 @@ async def handle_turn(
             recall_k=cfg.recall_k,
             recall_distance_max=cfg.recall_distance_max,
             system_prompt=system_prompt or cfg.system_prompt,
+            curiosities=curiosities,
         )
         # Persist after building but before the model call, so the user turn is
         # still recorded even if the chat/tool call fails (matches prior behaviour).
@@ -89,6 +106,11 @@ async def handle_turn(
             reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
         await memory.remember(peer, "assistant", reply)
+        # Fire-and-forget: distil what Jeff became curious about / what got
+        # answered. maybe_detect never blocks (spawns) and never raises, so this
+        # can't delay or break the turn that already sent its reply.
+        if curiosity_driver is not None:
+            await curiosity_driver.maybe_detect(peer, text, reply)
     except Exception as e:
         # Deliberately structured: don't log the exception message (it may
         # contain Ollama response body shaped by peer prompts — see
@@ -221,7 +243,11 @@ async def run(cfg: Config) -> None:
             # received as CommandInvocation events (the daemon owns parsing).
             # Built once; log enabled names (mirror the tools/prompt-source
             # startup lines). Disabled → declare nothing, receive nothing.
-            commands = build_command_registry() if cfg.commands_enabled else None
+            commands = (
+                build_command_registry(curiosity_enabled=cfg.curiosity_enabled)
+                if cfg.commands_enabled
+                else None
+            )
             if commands is not None and len(commands):
                 log.info("commands enabled: %s", ", ".join(commands.names()))
             else:
@@ -233,6 +259,28 @@ async def run(cfg: Config) -> None:
                 embed_model=cfg.embed_model,
                 embed_dim=cfg.embed_dim,
             )
+
+            # Curiosity drive (motivation slice 1) — default OFF. Built only when
+            # enabled so the disabled path makes no extra DB/LLM calls and stays
+            # byte-identical to today. The store shares the embed client/model/dim
+            # with memory; the driver runs the fire-and-forget detection pass.
+            curiosity_store: CuriosityStore | None = None
+            curiosity_driver: CuriosityDriver | None = None
+            if cfg.curiosity_enabled:
+                curiosity_store = await CuriosityStore.create(
+                    pool,
+                    embed_client,
+                    embed_model=cfg.embed_model,
+                    embed_dim=cfg.embed_dim,
+                )
+                curiosity_driver = CuriosityDriver(curiosity_store, chat_provider, cfg)
+                log.info(
+                    "curiosity enabled (detect every %d turn(s), inject up to %d)",
+                    cfg.curiosity_every_turns,
+                    cfg.curiosity_max_open,
+                )
+            else:
+                log.info("curiosity disabled")
 
             client_kwargs: dict = {"socket_path": cfg.socket}
             if cfg.auth_seed_path:
@@ -268,6 +316,8 @@ async def run(cfg: Config) -> None:
                             text,
                             registry,
                             system_prompt,
+                            curiosity_store,
+                            curiosity_driver,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
@@ -281,6 +331,7 @@ async def run(cfg: Config) -> None:
                             commands,
                             system_prompt,
                             tuple(registry.names()),
+                            curiosity_store,
                         ),
                         name="jeff-events",
                     )
@@ -296,6 +347,8 @@ async def run(cfg: Config) -> None:
                         if exc is not None:
                             log.error("task %s failed: %s", t.get_name(), exc)
                     await dispatcher.drain()
+                    if curiosity_driver is not None:
+                        await curiosity_driver.aclose()
     finally:
         await pool.close()
 
@@ -308,6 +361,7 @@ async def _handle_command(
     inv: ensemble.CommandInvocation,
     system_prompt: str = "",
     tool_names: tuple[str, ...] = (),
+    curiosity_store: "CuriosityStore | None" = None,
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -328,6 +382,7 @@ async def _handle_command(
         args=inv.args,
         system_prompt=system_prompt,
         tool_names=tool_names,
+        curiosity=curiosity_store,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -344,6 +399,7 @@ async def _drain_events(
     commands: CommandRegistry | None = None,
     system_prompt: str = "",
     tool_names: tuple[str, ...] = (),
+    curiosity_store: "CuriosityStore | None" = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
@@ -359,7 +415,14 @@ async def _drain_events(
             # run inline rather than through the turn dispatcher (which rate-limits
             # and serialises LLM turns).
             await _handle_command(
-                handle, memory, cfg, commands, event, system_prompt, tool_names
+                handle,
+                memory,
+                cfg,
+                commands,
+                event,
+                system_prompt,
+                tool_names,
+                curiosity_store,
             )
             continue
         if not isinstance(event, ensemble.ChatMessage):
