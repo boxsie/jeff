@@ -24,6 +24,8 @@ from .prompt import build_history, compose_system_prompt
 from .reflection import Reflector, ReflectionStore
 from .screen import screen_text
 from .searxng import SearxngClient
+from .signal_cli import SignalCliClient
+from .signal_front import SignalHandle, run_signal_front
 from .tools import ToolRegistry, build_registry
 
 
@@ -539,6 +541,68 @@ async def run(cfg: Config) -> None:
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
 
+                    # Signal front door (default OFF) — Jeff's second inbound
+                    # channel. Built only when enabled so the disabled path makes
+                    # no extra connections and stays byte-identical. It reuses the
+                    # WHOLE turn pipeline: a SignalHandle adapter stands in for the
+                    # Ensemble handle (handle_turn only calls send_message), and a
+                    # dedicated dispatcher gives Signal its own per-peer
+                    # serialisation / rate-limit / drain. Replies route back over
+                    # Signal because the handler binds the SignalHandle.
+                    signal_client: SignalCliClient | None = None
+                    signal_dispatcher: TurnDispatcher | None = None
+                    signal_task: asyncio.Task | None = None
+                    if cfg.signal_enabled:
+                        if not cfg.signal_allowlist:
+                            log.warning(
+                                "JEFF_SIGNAL_ALLOWLIST is empty — Signal answers nobody"
+                            )
+                        signal_client = SignalCliClient(
+                            number=cfg.signal_number,
+                            allowlist=set(cfg.signal_allowlist),
+                            base_url=cfg.signal_api_url,
+                        )
+                        signal_handle = SignalHandle(signal_client)
+
+                        async def _on_signal_turn(peer: str, text: str) -> None:
+                            await handle_turn(
+                                signal_handle,
+                                memory,
+                                chat_provider,
+                                cfg,
+                                peer,
+                                text,
+                                registry,
+                                system_prompt,
+                                curiosity_store,
+                                curiosity_driver,
+                                reflection_store,
+                                reflector,
+                                mood_store,
+                                pinned_store,
+                                drive_store,
+                                appraisal_driver,
+                            )
+
+                        signal_dispatcher = TurnDispatcher(
+                            _on_signal_turn, _policy_from_config(cfg)
+                        )
+                        signal_task = asyncio.create_task(
+                            run_signal_front(
+                                signal_client,
+                                signal_dispatcher,
+                                poll_interval=cfg.signal_poll_interval,
+                            ),
+                            name="jeff-signal",
+                        )
+                        log.info(
+                            "signal front door enabled (api=%s, allowlist=%d)",
+                            cfg.signal_api_url,
+                            len(cfg.signal_allowlist),
+                        )
+                    else:
+                        log.info("signal front door disabled")
+
                     events_task = asyncio.create_task(
                         _drain_events(
                             handle,
@@ -557,8 +621,11 @@ async def run(cfg: Config) -> None:
                         name="jeff-events",
                     )
                     stop_task = asyncio.create_task(stop.wait(), name="jeff-stop")
+                    wait_set = {events_task, stop_task}
+                    if signal_task is not None:
+                        wait_set.add(signal_task)
                     done, pending = await asyncio.wait(
-                        {events_task, stop_task},
+                        wait_set,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     for t in pending:
@@ -568,6 +635,10 @@ async def run(cfg: Config) -> None:
                         if exc is not None:
                             log.error("task %s failed: %s", t.get_name(), exc)
                     await dispatcher.drain()
+                    if signal_dispatcher is not None:
+                        await signal_dispatcher.drain()
+                    if signal_client is not None:
+                        await signal_client.aclose()
                     if curiosity_driver is not None:
                         await curiosity_driver.aclose()
                     if reflector is not None:

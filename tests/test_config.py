@@ -33,6 +33,61 @@ def test_from_env_csv_allowlist():
     assert cfg.allowlist == ["EaaaA", "EbbbB", "EcccC"]
 
 
+def test_signal_disabled_by_default():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.signal_enabled is False
+    assert cfg.signal_allowlist == []
+    assert cfg.signal_api_url == "http://localhost:8080"
+    assert cfg.signal_poll_interval == 1.0
+    # No number required when the feature is off.
+    assert cfg.signal_number == ""
+
+
+def test_signal_enabled_requires_number():
+    with pytest.raises(ConfigError, match="JEFF_SIGNAL_NUMBER"):
+        Config.from_env(
+            {"JEFF_DB_URL": "postgresql://x", "JEFF_SIGNAL_ENABLED": "true"}
+        )
+
+
+def test_signal_enabled_requires_api_url():
+    with pytest.raises(ConfigError, match="JEFF_SIGNAL_API_URL"):
+        Config.from_env(
+            {
+                "JEFF_DB_URL": "postgresql://x",
+                "JEFF_SIGNAL_ENABLED": "true",
+                "JEFF_SIGNAL_NUMBER": "+15550000000",
+                "JEFF_SIGNAL_API_URL": "",
+            }
+        )
+
+
+def test_signal_enabled_with_number_and_allowlist():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_SIGNAL_ENABLED": "true",
+            "JEFF_SIGNAL_NUMBER": "+15550000000",
+            "JEFF_SIGNAL_ALLOWLIST": "+14441111111, +13332222222",
+        }
+    )
+    assert cfg.signal_enabled is True
+    assert cfg.signal_number == "+15550000000"
+    assert cfg.signal_allowlist == ["+14441111111", "+13332222222"]
+
+
+def test_signal_enabled_empty_allowlist_is_allowed_at_load():
+    # An empty allowlist means default-deny; run() warns, but load doesn't fail.
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_SIGNAL_ENABLED": "true",
+            "JEFF_SIGNAL_NUMBER": "+15550000000",
+        }
+    )
+    assert cfg.signal_enabled is True and cfg.signal_allowlist == []
+
+
 def test_embed_dim_bounds():
     # W3 #20123205: env-supplied OLLAMA_EMBED_DIM must be bounded so a
     # hostile or typo value can't reach the schema DDL (was format()-ed

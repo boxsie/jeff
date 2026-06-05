@@ -91,6 +91,15 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_REMEMBER_ENABLED` | `false` | Explicit/pinned memory: lets Jeff deliberately keep a note via the `remember` tool, and you pin one via `/remember <text>` — both write to one shared store and ride in the prompt as an additive "Things to remember" block (always injected, never decays). Distinct from the automatic per-turn memory and the auto-distilled reflection facts. Off ⇒ no extra store/tool/command (byte-identical to today). Adds the `/remember` command and a section to `/mind`. Needs `JEFF_TOOLS_ENABLED` for the tool. |
 | `JEFF_REMEMBER_MAX_ITEMS` | `20` | Cap on how many pins are injected into the prompt and listed in `/mind` (most recent first). |
 | `JEFF_REMEMBER_MAX_CHARS` | `2000` | Cap on a single pinned note's length (tool/command-enforced, with a higher hard byte cap in the store as defence-in-depth). |
+| `JEFF_APPRAISAL_ENABLED` | `false` | Appraisal/reward drive: after a turn, a fire-and-forget pass rates the exchange against four standing drives (connection, novelty, competence, self-expression) and nudges their levels, which decay toward a baseline over time and ride in the prompt as an additive "Your drives right now" block. An affective state machine, not RL — wipe the store and it's gone. Off ⇒ no extra store/LLM calls (byte-identical to today). Adds a drives section to `/mind`. |
+| `JEFF_APPRAISAL_EVERY_TURNS` | `1` | Run the appraisal pass every N turns per peer (throttle the extra LLM call). |
+| `JEFF_DRIVE_DECAY_HALF_LIFE_HOURS` | `24` | Half-life (hours) for a drive level relaxing back toward its baseline. Decay is computed lazily at read time, no background loop. |
+| `JEFF_DRIVES_MAX_CHARS` | `2000` | Cap on the rendered "Your drives right now" prompt block. |
+| `JEFF_SIGNAL_ENABLED` | `false` | Signal front door: a second inbound channel where you text Jeff's dedicated Signal number and it replies on the same thread, reusing the whole turn pipeline (memory, tools, drives). Off ⇒ no Signal client/loop (byte-identical to today). Needs a registered number + a running [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) in `json-rpc` mode. |
+| `JEFF_SIGNAL_API_URL` | `http://localhost:8080` | Base URL of the signal-cli-rest-api instance. Startup fails fast if Signal is enabled but this is empty. |
+| `JEFF_SIGNAL_NUMBER` | _empty_ | Jeff's own registered Signal number (E.164). **Required** when `JEFF_SIGNAL_ENABLED=true` (startup fails fast if missing). |
+| `JEFF_SIGNAL_ALLOWLIST` | _empty_ | Comma-separated operator phone numbers (E.164) allowed to talk to Jeff over Signal. Empty = answer nobody (default-deny). Signal authenticates the sender; this authorises it. |
+| `JEFF_SIGNAL_POLL_INTERVAL` | `1.0` | Seconds between signal-cli receive polls. |
 
 ## Commands
 

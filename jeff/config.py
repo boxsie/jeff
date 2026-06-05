@@ -216,6 +216,12 @@ class Config:
     drive_decay_half_life_hours: float
     drives_max_chars: int
 
+    signal_enabled: bool
+    signal_api_url: str
+    signal_number: str
+    signal_allowlist: list[str]
+    signal_poll_interval: float
+
     max_inflight: int
     per_peer_concurrency: int
     peer_rate_per_minute: float
@@ -269,6 +275,19 @@ class Config:
         searxng_url = e.get("JEFF_SEARXNG_URL", "http://localhost:8888").strip()
         if search_enabled and not searxng_url:
             raise ConfigError("JEFF_SEARCH_ENABLED is on but JEFF_SEARXNG_URL is empty")
+
+        # Signal front door (default off). When on, Jeff needs its own registered
+        # Signal number and the signal-cli-rest-api endpoint — fail fast if either
+        # is missing rather than discovering it at first poll. An empty allowlist
+        # is allowed at load (it means default-deny); run() warns, mirroring the
+        # empty-Ensemble-allowlist warning.
+        signal_enabled = _parse_bool(e.get("JEFF_SIGNAL_ENABLED", "false"))
+        signal_api_url = e.get("JEFF_SIGNAL_API_URL", "http://localhost:8080").strip()
+        signal_number = (e.get("JEFF_SIGNAL_NUMBER") or "").strip()
+        if signal_enabled and not signal_number:
+            raise ConfigError("JEFF_SIGNAL_ENABLED is on but JEFF_SIGNAL_NUMBER is empty")
+        if signal_enabled and not signal_api_url:
+            raise ConfigError("JEFF_SIGNAL_ENABLED is on but JEFF_SIGNAL_API_URL is empty")
 
         return Config(
             name=e.get("JEFF_NAME", "jeff"),
@@ -352,6 +371,15 @@ class Config:
                 e.get("JEFF_DRIVE_DECAY_HALF_LIFE_HOURS", "24")
             ),
             drives_max_chars=int(e.get("JEFF_DRIVES_MAX_CHARS", "2000")),
+            # Signal front door (default off): when off the client/loop are never
+            # built, so behaviour is byte-identical. signal_number is Jeff's own
+            # registered Signal number; signal_allowlist is the operator-number
+            # allowlist (default-deny when empty), mirroring JEFF_ALLOWLIST.
+            signal_enabled=signal_enabled,
+            signal_api_url=signal_api_url,
+            signal_number=signal_number,
+            signal_allowlist=_csv(e.get("JEFF_SIGNAL_ALLOWLIST")),
+            signal_poll_interval=float(e.get("JEFF_SIGNAL_POLL_INTERVAL", "1.0")),
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),
