@@ -135,6 +135,33 @@ class _Derived:
         self.text = text
 
 
+class FakePinnedStore:
+    """Records pinned-memory reads/writes/wipes for the command paths."""
+
+    def __init__(self, pins=None):
+        self._pins = list(pins or [])
+        self.added: list[tuple[str, str]] = []  # (text, source)
+        self.forgotten: list[str] = []
+        self.next_id: int | None = 1
+
+    async def add(self, peer, text, *, source="jeff"):
+        self.added.append((text, source))
+        return self.next_id
+
+    async def list(self, peer, *, limit=50):
+        return self._pins[:limit]
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return len(self._pins)
+
+
+class _Pin:
+    def __init__(self, text: str, source: str = "jeff"):
+        self.text = text
+        self.source = source
+
+
 def _ctx(
     memory=None,
     args="",
@@ -143,6 +170,7 @@ def _ctx(
     tool_names=(),
     curiosity=None,
     reflection=None,
+    pinned=None,
 ) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
@@ -154,6 +182,7 @@ def _ctx(
         tool_names=tool_names,
         curiosity=curiosity,
         reflection=reflection,
+        pinned=pinned,
     )
 
 
@@ -455,4 +484,63 @@ async def test_forget_yes_also_wipes_reflection_store():
     )
     assert mem.forgotten == ["EpeerD"]
     assert refl.forgotten == ["EpeerD"]
+    assert "clean slate" in reply.lower()
+
+
+# --- /remember + pinned memory --------------------------------------------
+
+
+def test_remember_declared_only_when_enabled():
+    assert build_command_registry().get("remember") is None
+    assert build_command_registry(remember_enabled=True).get("remember") is not None
+    # /mind is also declared once remember is on (even with the others off).
+    assert build_command_registry(remember_enabled=True).get("mind") is not None
+
+
+@pytest.mark.asyncio
+async def test_remember_pins_text():
+    store = FakePinnedStore()
+    reg = build_command_registry(remember_enabled=True)
+    reply = await reg.dispatch("remember", _ctx(args="Has a dog named Biscuit", pinned=store))
+    assert store.added == [("Has a dog named Biscuit", "operator")]
+    assert "pinned" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_remember_empty_shows_usage():
+    store = FakePinnedStore()
+    reg = build_command_registry(remember_enabled=True)
+    reply = await reg.dispatch("remember", _ctx(args="   ", pinned=store))
+    assert store.added == []
+    assert "usage" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_remember_reports_duplicate():
+    store = FakePinnedStore()
+    store.next_id = None
+    reg = build_command_registry(remember_enabled=True)
+    reply = await reg.dispatch("remember", _ctx(args="dup", pinned=store))
+    assert "already had that pinned" in reply
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_pinned_with_provenance():
+    store = FakePinnedStore(pins=[_Pin("Likes tea", source="operator"), _Pin("Has a dog", source="jeff")])
+    reg = build_command_registry(remember_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(pinned=store))
+    assert "pinned memory" in reply.lower()
+    assert "[you] Likes tea" in reply
+    assert "[me] Has a dog" in reply
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_pinned_store():
+    mem = FakeMemory()
+    store = FakePinnedStore(pins=[_Pin("x")])
+    reply = await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", pinned=store)
+    )
+    assert mem.forgotten == ["EpeerD"]
+    assert store.forgotten == ["EpeerD"]
     assert "clean slate" in reply.lower()

@@ -84,6 +84,13 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_CURIOSITY_EVERY_TURNS` | `1` | Run the curiosity detection pass every N turns per peer (throttle the extra LLM call). |
 | `JEFF_CURIOSITY_MAX_OPEN` | `6` | Cap on how many open questions are injected into the prompt's "You're curious about" block. |
 | `JEFF_CURIOSITY_MAX_NEW` | `3` | Cap on new questions stored per detection pass. |
+| `JEFF_MOOD_ENABLED` | `false` | Mood drive: Jeff carries a short-lived, self-chosen affective state set via the `set_mood` tool, which colours how it talks (an additive "How you're feeling right now" block) until it fades. Jeff authors its own mood definitions with `define_mood` — there is no seed palette, so the feature is inert until the first definition. Off ⇒ no extra store/tools (byte-identical to today). Adds the `/mood` command and a mood section to `/mind`. Needs `JEFF_TOOLS_ENABLED`. |
+| `JEFF_MOOD_DEFAULT_HOURS` | `6` | How many hours a mood lasts when Jeff doesn't specify a duration. |
+| `JEFF_MOOD_MAX_HOURS` | `48` | Hard ceiling on any single mood's duration (the tool clamps to this). |
+| `JEFF_MOOD_MAX_CHARS` | `2000` | Cap on a stored mood definition's length (tool-enforced, with a higher hard byte cap in the store as defence-in-depth). |
+| `JEFF_REMEMBER_ENABLED` | `false` | Explicit/pinned memory: lets Jeff deliberately keep a note via the `remember` tool, and you pin one via `/remember <text>` — both write to one shared store and ride in the prompt as an additive "Things to remember" block (always injected, never decays). Distinct from the automatic per-turn memory and the auto-distilled reflection facts. Off ⇒ no extra store/tool/command (byte-identical to today). Adds the `/remember` command and a section to `/mind`. Needs `JEFF_TOOLS_ENABLED` for the tool. |
+| `JEFF_REMEMBER_MAX_ITEMS` | `20` | Cap on how many pins are injected into the prompt and listed in `/mind` (most recent first). |
+| `JEFF_REMEMBER_MAX_CHARS` | `2000` | Cap on a single pinned note's length (tool/command-enforced, with a higher hard byte cap in the store as defence-in-depth). |
 
 ## Commands
 

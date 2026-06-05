@@ -45,6 +45,8 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     from .config import Config
     from .curiosity import CuriosityStore
     from .memory import Memory, Message
+    from .mood import MoodStore
+    from .pinned import PinnedMemoryStore
     from .reflection import ReflectionStore
 
 
@@ -69,10 +71,12 @@ class CommandContext:
     base + capabilities addendum), composed once at startup; `tool_names` is the
     registered tool set. Both are here so `/debug` can show the real working
     context rather than reconstructing it. `curiosity` is the open-questions store
-    (None when the curiosity drive is off) and `reflection` is the derived persona
-    store (None when reflection is off) so `/mind` can show them and `/forget` can
-    wipe them. They default to empty/None so callers that don't care (and older
-    tests) need not supply them.
+    (None when the curiosity drive is off), `reflection` is the derived persona
+    store (None when reflection is off), `mood` is the affective-state store
+    (None when the mood drive is off), and `pinned` is the explicit/pinned-memory
+    store (None when the remember drive is off) so `/mind`/`/mood`/`/remember` can
+    show/write them and `/forget` can wipe them. They default to empty/None so
+    callers that don't care (and older tests) need not supply them.
     """
 
     handle: "ensemble.ServiceHandle"
@@ -84,6 +88,8 @@ class CommandContext:
     tool_names: tuple[str, ...] = ()
     curiosity: "CuriosityStore | None" = None
     reflection: "ReflectionStore | None" = None
+    mood: "MoodStore | None" = None
+    pinned: "PinnedMemoryStore | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -200,6 +206,12 @@ async def _cmd_forget(ctx: CommandContext) -> str:
         await ctx.curiosity.forget(ctx.peer)
     if ctx.reflection is not None:
         await ctx.reflection.forget(ctx.peer)
+    # Moods + their definitions are part of the same relationship; wipe them too.
+    if ctx.mood is not None:
+        await ctx.mood.forget(ctx.peer)
+    # Deliberately-pinned memories are wiped too — a clean slate is clean.
+    if ctx.pinned is not None:
+        await ctx.pinned.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -359,19 +371,112 @@ async def _cmd_debug(ctx: CommandContext) -> str:
 # --- /mind: the curiosity drive's introspection view ----------------------
 
 
-async def _cmd_mind(ctx: CommandContext) -> str:
-    """Show what's on Jeff's mind: open questions it wants to ask (curiosity) and
-    the facts + opinions it has formed (reflection). Deterministic dump (no model
-    call), sibling to `/debug`. Declared whenever either drive is enabled; each
-    section appears only when its store is present.
-    """
-    if ctx.curiosity is None and ctx.reflection is None:
+def _format_remaining(seconds: float) -> str:
+    """A coarse '~3h 20m left' rendering for a mood's remaining lifetime."""
+    s = int(max(0, seconds))
+    hours, s = divmod(s, 3600)
+    minutes, _ = divmod(s, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts) + " left"
+
+
+async def _mood_line(ctx: CommandContext) -> str:
+    """One-line description of the active mood (or neutral), shared by `/mood`
+    and the `/mind` mood section. Computes 'time left' from the DB expiry against
+    wall-clock now() — coarse minutes are plenty for a status line."""
+    from datetime import datetime, timezone
+
+    active = await ctx.mood.active_mood(ctx.peer)
+    if active is None:
+        return "neutral (no active mood)"
+    remaining = (active.expires_at - datetime.now(timezone.utc)).total_seconds()
+    return f"{active.name} — {_format_remaining(remaining)}"
+
+
+async def _cmd_mood(ctx: CommandContext) -> str:
+    """Show Jeff's current mood and how long it has left (or 'neutral'). Declared
+    only when the mood drive is on. Deterministic dump, no model call."""
+    if ctx.mood is None:
+        return "Moods aren't switched on right now."
+    line = await _mood_line(ctx)
+    defined = await ctx.mood.count_definitions(ctx.peer)
+    return (
+        f"**mood**\n```\n{line}\n"
+        f"defined moods: {defined}\n```"
+    )
+
+
+async def _cmd_remember(ctx: CommandContext) -> str:
+    """Operator-facing pin: `/remember <text>` writes a note to the shared pinned
+    store (same store the `remember` tool writes to), tagged source=operator.
+    Declared only when the remember drive is on. Pure DB — no model call."""
+    if ctx.pinned is None:
+        return "Explicit memory isn't switched on right now."
+    text = ctx.args.strip()
+    if not text:
         return (
-            "Neither curiosity nor reflection is switched on right now, so there's "
-            "nothing on my mind to show."
+            "Usage: `/remember <something>` — I'll pin it to my long-term memory "
+            "so it stays in mind. Use `/mind` to see what's pinned."
+        )
+    if len(text) > ctx.cfg.remember_max_chars:
+        return (
+            f"That's a bit long to pin (max {ctx.cfg.remember_max_chars} "
+            "characters) — try a more concise note."
+        )
+    from .pinned import SOURCE_OPERATOR
+
+    pid = await ctx.pinned.add(ctx.peer, text, source=SOURCE_OPERATOR)
+    if pid is None:
+        return "I already had that pinned — nothing to add."
+    return "Pinned — I'll keep that in mind."
+
+
+async def _cmd_mind(ctx: CommandContext) -> str:
+    """Show what's on Jeff's mind: open questions it wants to ask (curiosity), the
+    facts + opinions it has formed (reflection), its current mood, and what it has
+    deliberately pinned (remember). A deterministic dump (no model call), sibling
+    to `/debug`. Declared whenever any of those drives is enabled; each section
+    appears only when its store is present.
+    """
+    if (
+        ctx.curiosity is None
+        and ctx.reflection is None
+        and ctx.mood is None
+        and ctx.pinned is None
+    ):
+        return (
+            "None of curiosity, reflection, moods, or pinned memory is switched on "
+            "right now, so there's nothing on my mind to show."
         )
 
     sections: list[str] = []
+
+    if ctx.pinned is not None:
+        pins = await ctx.pinned.list(ctx.peer, limit=ctx.cfg.remember_max_items)
+        lines = [f"pinned memory ({len(pins)}):"]
+        if pins:
+            # Show provenance: who chose to keep it (you vs me).
+            lines.extend(
+                f"  • [{'you' if p.source == 'operator' else 'me'}] {_truncate(p.text)}"
+                for p in pins
+            )
+        else:
+            lines.append("  (nothing pinned yet — ask me to remember something)")
+        sections.append("\n".join(lines))
+
+    if ctx.mood is not None:
+        line = await _mood_line(ctx)
+        defs = await ctx.mood.list_definitions(ctx.peer)
+        lines = [f"mood: {line}"]
+        if defs:
+            lines.append(f"moods you've defined ({len(defs)}):")
+            lines.extend(f"  • {d.name}: {_truncate(d.description)}" for d in defs)
+        else:
+            lines.append("  (no moods defined yet — we author them together)")
+        sections.append("\n".join(lines))
 
     if ctx.curiosity is not None:
         open_cur = await ctx.curiosity.open_curiosities(ctx.peer, limit=20)
@@ -408,13 +513,18 @@ async def _cmd_mind(ctx: CommandContext) -> str:
 
 
 def build_command_registry(
-    *, curiosity_enabled: bool = False, reflection_enabled: bool = False
+    *,
+    curiosity_enabled: bool = False,
+    reflection_enabled: bool = False,
+    mood_enabled: bool = False,
+    remember_enabled: bool = False,
 ) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
 
-    `/mind` is declared only when curiosity OR reflection is on — keeping the
-    feature-off path's declared command set unchanged."""
+    `/mind` is declared when any of curiosity / reflection / mood / remember is
+    on; `/mood` only when the mood drive is on; `/remember` only when the remember
+    drive is on — keeping the feature-off path's declared command set unchanged."""
     cmds = [
         Command(
             "clear",
@@ -435,8 +545,21 @@ def build_command_registry(
             usage="[prompt|recall <query>]",
         ),
     ]
-    if curiosity_enabled or reflection_enabled:
+    if curiosity_enabled or reflection_enabled or mood_enabled or remember_enabled:
         cmds.append(
             Command("mind", "show what's on my mind right now", _cmd_mind)
+        )
+    if mood_enabled:
+        cmds.append(
+            Command("mood", "show my current mood and how long it has left", _cmd_mood)
+        )
+    if remember_enabled:
+        cmds.append(
+            Command(
+                "remember",
+                "pin something to my long-term memory",
+                _cmd_remember,
+                usage="<something to remember>",
+            )
         )
     return CommandRegistry(cmds)

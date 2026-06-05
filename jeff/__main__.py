@@ -17,7 +17,9 @@ from .config import Config, ConfigError
 from .curiosity import CuriosityStore
 from .main import run as _run
 from .memory import Memory
+from .mood import MoodStore
 from .ollama import Ollama
+from .pinned import PinnedMemoryStore
 from .reflection import ReflectionStore
 
 
@@ -110,9 +112,16 @@ async def _reset_memory(cfg: Config) -> None:
                 embed_dim=cfg.embed_dim,
             )
             await reflection.reset()
+            # Moods + pinned memory are plain tables (no embedding), so they're
+            # unaffected by a dimension change — but reset-memory means "clean
+            # slate", so drop and recreate them too for consistency.
+            mood = MoodStore(pool)
+            await mood.reset()
+            pinned = PinnedMemoryStore(pool)
+            await pinned.reset()
             print(
-                f"memory reset — messages + curiosities + derived_memory schema "
-                f"recreated at dim={cfg.embed_dim} (model={cfg.embed_model})"
+                f"memory reset — messages + curiosities + derived_memory + mood + "
+                f"pinned schema recreated at dim={cfg.embed_dim} (model={cfg.embed_model})"
             )
     finally:
         await pool.close()

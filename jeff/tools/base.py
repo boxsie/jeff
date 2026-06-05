@@ -44,6 +44,13 @@ class Tool(ABC):
     name: ClassVar[str]
     description: ClassVar[str]
     parameters: ClassVar[dict]
+    # When True, `dispatch` injects the current turn's peer address as a `peer`
+    # kwarg to `run` (used by tools that read/write peer-scoped state, e.g. the
+    # mood tools). The model never supplies this — `_validate_args` drops any
+    # `peer` it sends because the tool doesn't declare it in `parameters`, then
+    # dispatch injects the real one — so it can't be spoofed. Default False, so
+    # the search/time tools and their specs are unchanged.
+    needs_peer: ClassVar[bool] = False
 
     @abstractmethod
     async def run(self, **kwargs) -> str:
@@ -95,6 +102,7 @@ class ToolRegistry:
         name: str,
         arguments: str,
         *,
+        peer: str | None = None,
         timeout: float = DEFAULT_TOOL_TIMEOUT_S,
     ) -> str:
         """Run tool `name` with JSON-string `arguments`; return a safe string.
@@ -102,6 +110,12 @@ class ToolRegistry:
         Every failure mode (unknown tool, bad JSON, bad args, raise, timeout)
         becomes a short `error: …` string the model can read. Nothing from an
         exception body reaches the model — only the tool name and a category.
+
+        `peer` is the current turn's address; it's injected as a `peer` kwarg
+        only for tools that declare `needs_peer = True` (peer-scoped state tools).
+        It's a keyword-only injection the model can't reach: any model-supplied
+        `peer` was already dropped by `_validate_args` (the tool doesn't declare
+        it), so a tool can trust this is the real caller.
         """
         tool = self._tools.get(name)
         if tool is None:
@@ -121,8 +135,14 @@ class ToolRegistry:
             log.info("tool dispatch: invalid-args tool=%s", name)
             return f"error: tool {name!r} {kwargs_or_msg}"
 
+        call_kwargs = kwargs_or_msg
+        if getattr(tool, "needs_peer", False):
+            # Injected after validation so it can't collide with (or be spoofed
+            # by) a model-supplied arg — the validator already stripped any.
+            call_kwargs = {**kwargs_or_msg, "peer": peer}
+
         try:
-            result = await asyncio.wait_for(tool.run(**kwargs_or_msg), timeout=timeout)
+            result = await asyncio.wait_for(tool.run(**call_kwargs), timeout=timeout)
         except asyncio.TimeoutError:
             log.warning("tool %s timed out after %.0fs", name, timeout)
             return f"error: tool {name!r} timed out"

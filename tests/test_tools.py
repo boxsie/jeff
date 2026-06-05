@@ -85,6 +85,22 @@ def test_duplicate_registration_rejected():
         reg.register(EchoTool())
 
 
+class PeerEchoTool(Tool):
+    """Declares needs_peer; echoes the injected peer + a model-supplied arg."""
+
+    name = "peer_echo"
+    description = "Echo the peer."
+    parameters = {
+        "type": "object",
+        "properties": {"note": {"type": "string"}},
+        "required": [],
+    }
+    needs_peer = True
+
+    async def run(self, **kwargs) -> str:
+        return f"peer={kwargs.get('peer')} note={kwargs.get('note')}"
+
+
 # --- dispatch happy + failure paths ----------------------------------------
 
 
@@ -92,6 +108,35 @@ def test_duplicate_registration_rejected():
 async def test_dispatch_runs_tool_with_parsed_args():
     reg = ToolRegistry([EchoTool()])
     out = await reg.dispatch("echo", json.dumps({"message": "hi"}))
+    assert out == "echo: hi"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_injects_peer_for_needs_peer_tool():
+    reg = ToolRegistry([PeerEchoTool()])
+    out = await reg.dispatch("peer_echo", json.dumps({"note": "x"}), peer="EpeerA")
+    assert "peer=EpeerA" in out
+    assert "note=x" in out
+
+
+@pytest.mark.asyncio
+async def test_dispatch_peer_cannot_be_spoofed_by_model_args():
+    # A model-supplied `peer` is dropped by validation (not a declared property),
+    # then the real caller is injected — so it can't be aimed at another peer.
+    reg = ToolRegistry([PeerEchoTool()])
+    out = await reg.dispatch(
+        "peer_echo", json.dumps({"peer": "EVIL", "note": "x"}), peer="EpeerA"
+    )
+    assert "peer=EpeerA" in out
+    assert "EVIL" not in out
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_inject_peer_for_normal_tool():
+    # Default needs_peer=False → no peer kwarg leaks into a tool that doesn't want
+    # it (would otherwise trip run(**kwargs) for tools with strict signatures).
+    reg = ToolRegistry([EchoTool()])
+    out = await reg.dispatch("echo", json.dumps({"message": "hi"}), peer="EpeerA")
     assert out == "echo: hi"
 
 

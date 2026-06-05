@@ -202,6 +202,15 @@ class Config:
     reflection_use_persona: bool
     persona_max_chars: int
 
+    mood_enabled: bool
+    mood_default_hours: float
+    mood_max_hours: float
+    mood_max_chars: int
+
+    remember_enabled: bool
+    remember_max_items: int
+    remember_max_chars: int
+
     max_inflight: int
     per_peer_concurrency: int
     peer_rate_per_minute: float
@@ -295,7 +304,7 @@ class Config:
             # default OFF: when off the store/reflector are never built, so
             # behaviour is byte-identical. Defaults mirror the deployed configmap.
             reflection_enabled=_parse_bool(e.get("JEFF_REFLECTION_ENABLED", "false")),
-            reflection_every_turns=int(e.get("JEFF_REFLECTION_EVERY_TURNS", "20")),
+            reflection_every_turns=int(e.get("JEFF_REFLECTION_EVERY_TURNS", "8")),
             reflection_max_chars=int(e.get("JEFF_REFLECTION_MAX_CHARS", "6000")),
             reflection_max_items=int(e.get("JEFF_REFLECTION_MAX_ITEMS", "6")),
             # Feed the base persona into the distillation pass (default on) so
@@ -304,6 +313,27 @@ class Config:
                 e.get("JEFF_REFLECTION_USE_PERSONA", "true")
             ),
             persona_max_chars=int(e.get("JEFF_PERSONA_MAX_CHARS", "2000")),
+            # Mood drive (affective state, inner-life slice 3) — default OFF:
+            # when off the store/tools are never built, so behaviour is
+            # byte-identical. Jeff sets/defines moods at runtime via tools; there
+            # is deliberately no seed palette (co-authored with the operator).
+            # default_hours is how long a set mood lasts when Jeff doesn't say;
+            # max_hours is the hard ceiling on any one mood; max_chars caps a
+            # stored definition (tool-enforced, with a higher hard byte cap in
+            # the store as defence-in-depth).
+            mood_enabled=_parse_bool(e.get("JEFF_MOOD_ENABLED", "false")),
+            mood_default_hours=float(e.get("JEFF_MOOD_DEFAULT_HOURS", "6")),
+            mood_max_hours=float(e.get("JEFF_MOOD_MAX_HOURS", "48")),
+            mood_max_chars=int(e.get("JEFF_MOOD_MAX_CHARS", "2000")),
+            # Explicit/pinned memory (inner-life slice 4) — default OFF: when off
+            # the store/tool/command are never built, so behaviour is
+            # byte-identical. Jeff pins via the `remember` tool, the operator via
+            # `/remember`; both share one plain table (no embedding). max_items
+            # caps how many pins are injected + listed; max_chars caps one pin
+            # (tool/command-enforced, with a higher hard byte cap in the store).
+            remember_enabled=_parse_bool(e.get("JEFF_REMEMBER_ENABLED", "false")),
+            remember_max_items=int(e.get("JEFF_REMEMBER_MAX_ITEMS", "20")),
+            remember_max_chars=int(e.get("JEFF_REMEMBER_MAX_CHARS", "2000")),
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),

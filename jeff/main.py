@@ -16,7 +16,9 @@ from .dispatch import DispatchPolicy, TurnDispatcher
 from .llm import ChatProvider, ChatResult
 from .llm import make_chat_provider
 from .memory import Memory
+from .mood import MoodStore
 from .ollama import Ollama
+from .pinned import Pinned, PinnedMemoryStore
 from .prompt import build_history, compose_system_prompt
 from .reflection import Reflector, ReflectionStore
 from .screen import screen_text
@@ -35,6 +37,24 @@ _TOOL_CAP_MESSAGE = (
 )
 
 
+def _pack_pinned(rows: list[Pinned], max_chars: int) -> list[str]:
+    """Pack pinned-memory texts into the prompt block within a char budget.
+
+    Rows arrive most-recent-first; we keep taking until the budget is spent (but
+    always keep at least one, so a single over-budget pin still shows). Mirrors
+    ReflectionStore.persona's packing discipline.
+    """
+    out: list[str] = []
+    used = 0
+    for r in rows:
+        cost = len(r.text)
+        if used + cost > max_chars and out:
+            break
+        used += cost
+        out.append(r.text)
+    return out
+
+
 async def handle_turn(
     handle: ensemble.ServiceHandle,
     memory: Memory,
@@ -48,6 +68,8 @@ async def handle_turn(
     curiosity_driver: "CuriosityDriver | None" = None,
     reflection_store: "ReflectionStore | None" = None,
     reflector: "Reflector | None" = None,
+    mood_store: "MoodStore | None" = None,
+    pinned_store: "PinnedMemoryStore | None" = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -99,6 +121,32 @@ async def handle_turn(
             except Exception as e:
                 log.error("persona fetch failed peer=%s exc=%s", peer, type(e).__name__)
 
+        # Jeff's current mood for this peer — surfaced into the prompt's "## How
+        # you're feeling right now" block. Best-effort + additive: a store read
+        # fault (or no active mood) must never break the reply — fall back to no
+        # block. The DB clock decides expiry, so an expired mood reads as None.
+        mood_name = ""
+        mood_description = ""
+        if mood_store is not None:
+            try:
+                active = await mood_store.active_mood(peer)
+                if active is not None:
+                    mood_name = active.name
+                    mood_description = active.description or ""
+            except Exception as e:
+                log.error("mood fetch failed peer=%s exc=%s", peer, type(e).__name__)
+
+        # Jeff's deliberately-pinned memories — surfaced into the prompt's "##
+        # Things to remember" block. Best-effort + additive: a store read fault
+        # must never break the reply, so fall back to no block.
+        pinned: list[str] = []
+        if pinned_store is not None:
+            try:
+                rows = await pinned_store.list(peer, limit=cfg.remember_max_items)
+                pinned = _pack_pinned(rows, cfg.remember_max_chars)
+            except Exception as e:
+                log.error("pinned fetch failed peer=%s exc=%s", peer, type(e).__name__)
+
         # Build the prompt BEFORE persisting the current user message.
         # build_history appends the current turn explicitly; if we stored it
         # first, recent()/recall() would also return it and the message would
@@ -115,12 +163,15 @@ async def handle_turn(
             curiosities=curiosities,
             facts=facts,
             opinions=opinions,
+            mood_name=mood_name,
+            mood_description=mood_description,
+            pinned=pinned,
         )
         # Persist after building but before the model call, so the user turn is
         # still recorded even if the chat/tool call fails (matches prior behaviour).
         await memory.remember(peer, "user", text)
         if registry is not None and cfg.tools_enabled and len(registry):
-            reply = await _run_tool_loop(chat_provider, registry, history, cfg)
+            reply = await _run_tool_loop(chat_provider, registry, history, cfg, peer)
         else:
             reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
@@ -169,6 +220,7 @@ async def _run_tool_loop(
     registry: ToolRegistry,
     history: list[dict],
     cfg: Config,
+    peer: str,
 ) -> str:
     """Call the provider, execute any tool calls, repeat until a final answer.
 
@@ -177,6 +229,9 @@ async def _run_tool_loop(
     unknown tools / bad args / raises / timeouts, so the loop never crashes on
     a tool fault. Returns the model's final content, or a graceful cap message
     if it never stops calling tools.
+
+    `peer` is the current turn's address; it's passed to `dispatch` so
+    peer-scoped tools (e.g. the mood tools) write to the right peer's state.
     """
     specs = registry.specs()
     messages = list(history)
@@ -187,7 +242,9 @@ async def _run_tool_loop(
         log.info("tool turn: calls=%s", ",".join(tc.name for tc in result.tool_calls))
         messages.append(_assistant_tool_message(result))
         for tc in result.tool_calls:
-            out = await registry.dispatch(tc.name, tc.arguments, timeout=cfg.tool_timeout_s)
+            out = await registry.dispatch(
+                tc.name, tc.arguments, peer=peer, timeout=cfg.tool_timeout_s
+            )
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
     log.warning("tool loop hit iteration cap (%d)", cfg.max_tool_iters)
     return _TOOL_CAP_MESSAGE
@@ -251,34 +308,6 @@ async def run(cfg: Config) -> None:
         ):
             log.info("chat provider=%s model=%s", cfg.llm_provider, cfg.chat_model)
             log.info("system prompt source=%s", cfg.system_prompt_source)
-            registry = build_registry(cfg, searxng=searxng)
-            if cfg.tools_enabled and len(registry):
-                # Names only — never tool args (the leaky-info discipline).
-                log.info("tools enabled: %s", ", ".join(registry.names()))
-            else:
-                log.info("tools disabled")
-            # Compose the effective prompt once: operator's base (file/env/
-            # default) + a capabilities addendum describing the registered tools
-            # and Markdown rendering. Tools off → addendum is just the formatting
-            # note. Built once, reused for every turn.
-            system_prompt = compose_system_prompt(cfg.system_prompt, registry.names())
-
-            # Chat commands are declared to the daemon at registration and
-            # received as CommandInvocation events (the daemon owns parsing).
-            # Built once; log enabled names (mirror the tools/prompt-source
-            # startup lines). Disabled → declare nothing, receive nothing.
-            commands = (
-                build_command_registry(
-                    curiosity_enabled=cfg.curiosity_enabled,
-                    reflection_enabled=cfg.reflection_enabled,
-                )
-                if cfg.commands_enabled
-                else None
-            )
-            if commands is not None and len(commands):
-                log.info("commands enabled: %s", ", ".join(commands.names()))
-            else:
-                log.info("commands disabled")
 
             memory = await Memory.create(
                 pool,
@@ -286,6 +315,38 @@ async def run(cfg: Config) -> None:
                 embed_model=cfg.embed_model,
                 embed_dim=cfg.embed_dim,
             )
+
+            # Mood drive (inner-life slice 3) — default OFF. Built only when
+            # enabled so the disabled path makes no extra DB calls and stays
+            # byte-identical. Plain Postgres (no embedder) — a mood is temporal
+            # single-state, not a semantic set. The store backs the mood tools
+            # (added to the registry below) and the per-turn active-mood fetch.
+            mood_store: MoodStore | None = None
+            if cfg.mood_enabled:
+                mood_store = await MoodStore.create(pool)
+                log.info(
+                    "mood enabled (default %g h, max %g h)",
+                    cfg.mood_default_hours,
+                    cfg.mood_max_hours,
+                )
+            else:
+                log.info("mood disabled")
+
+            # Pinned / explicit memory (inner-life slice 4) — default OFF. Built
+            # only when enabled so the disabled path makes no extra DB calls and
+            # stays byte-identical. Plain Postgres (no embedder) — pins are always
+            # injected, never semantically recalled. Backs the `remember` tool
+            # (added to the registry below) + the `/remember` command + the
+            # per-turn pinned-memory fetch.
+            pinned_store: PinnedMemoryStore | None = None
+            if cfg.remember_enabled:
+                pinned_store = await PinnedMemoryStore.create(pool)
+                log.info(
+                    "remember enabled (inject up to %d pins)",
+                    cfg.remember_max_items,
+                )
+            else:
+                log.info("remember disabled")
 
             # Curiosity drive (motivation slice 1) — default OFF. Built only when
             # enabled so the disabled path makes no extra DB/LLM calls and stays
@@ -332,6 +393,44 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("reflection disabled")
 
+            # Registry built AFTER the stores so the mood tools can be wired to
+            # the mood store. Empty when tools are off → the no-tools turn path.
+            registry = build_registry(
+                cfg,
+                searxng=searxng,
+                mood_store=mood_store,
+                pinned_store=pinned_store,
+            )
+            if cfg.tools_enabled and len(registry):
+                # Names only — never tool args (the leaky-info discipline).
+                log.info("tools enabled: %s", ", ".join(registry.names()))
+            else:
+                log.info("tools disabled")
+            # Compose the effective prompt once: operator's base (file/env/
+            # default) + a capabilities addendum describing the registered tools
+            # and Markdown rendering. Tools off → addendum is just the formatting
+            # note. Built once, reused for every turn.
+            system_prompt = compose_system_prompt(cfg.system_prompt, registry.names())
+
+            # Chat commands are declared to the daemon at registration and
+            # received as CommandInvocation events (the daemon owns parsing).
+            # Built once; log enabled names (mirror the tools/prompt-source
+            # startup lines). Disabled → declare nothing, receive nothing.
+            commands = (
+                build_command_registry(
+                    curiosity_enabled=cfg.curiosity_enabled,
+                    reflection_enabled=cfg.reflection_enabled,
+                    mood_enabled=cfg.mood_enabled,
+                    remember_enabled=cfg.remember_enabled,
+                )
+                if cfg.commands_enabled
+                else None
+            )
+            if commands is not None and len(commands):
+                log.info("commands enabled: %s", ", ".join(commands.names()))
+            else:
+                log.info("commands disabled")
+
             client_kwargs: dict = {"socket_path": cfg.socket}
             if cfg.auth_seed_path:
                 client_kwargs["auth_seed"] = cfg.auth_seed_path
@@ -370,6 +469,8 @@ async def run(cfg: Config) -> None:
                             curiosity_driver,
                             reflection_store,
                             reflector,
+                            mood_store,
+                            pinned_store,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
@@ -385,6 +486,8 @@ async def run(cfg: Config) -> None:
                             tuple(registry.names()),
                             curiosity_store,
                             reflection_store,
+                            mood_store,
+                            pinned_store,
                         ),
                         name="jeff-events",
                     )
@@ -418,6 +521,8 @@ async def _handle_command(
     tool_names: tuple[str, ...] = (),
     curiosity_store: "CuriosityStore | None" = None,
     reflection_store: "ReflectionStore | None" = None,
+    mood_store: "MoodStore | None" = None,
+    pinned_store: "PinnedMemoryStore | None" = None,
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -440,6 +545,8 @@ async def _handle_command(
         tool_names=tool_names,
         curiosity=curiosity_store,
         reflection=reflection_store,
+        mood=mood_store,
+        pinned=pinned_store,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -458,6 +565,8 @@ async def _drain_events(
     tool_names: tuple[str, ...] = (),
     curiosity_store: "CuriosityStore | None" = None,
     reflection_store: "ReflectionStore | None" = None,
+    mood_store: "MoodStore | None" = None,
+    pinned_store: "PinnedMemoryStore | None" = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
@@ -482,6 +591,8 @@ async def _drain_events(
                 tool_names,
                 curiosity_store,
                 reflection_store,
+                mood_store,
+                pinned_store,
             )
             continue
         if not isinstance(event, ensemble.ChatMessage):

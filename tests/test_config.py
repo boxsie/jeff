@@ -313,7 +313,7 @@ def test_reflection_defaults_off():
     assert cfg.reflection_enabled is False
     # Defaults mirror the deployed configmap so flipping the flag needs no other
     # config change.
-    assert cfg.reflection_every_turns == 20
+    assert cfg.reflection_every_turns == 8
     assert cfg.reflection_max_chars == 6000
     assert cfg.reflection_max_items == 6
     assert cfg.persona_max_chars == 2000
@@ -339,6 +339,52 @@ def test_reflection_overrides_parsed():
     assert cfg.reflection_max_items == 4
     assert cfg.reflection_use_persona is False
     assert cfg.persona_max_chars == 1500
+
+
+def test_mood_defaults_off():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.mood_enabled is False
+    # Bounds default to sensible values; no seed palette by design.
+    assert cfg.mood_default_hours == 6
+    assert cfg.mood_max_hours == 48
+    assert cfg.mood_max_chars == 2000
+
+
+def test_mood_overrides_parsed():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_MOOD_ENABLED": "true",
+            "JEFF_MOOD_DEFAULT_HOURS": "4",
+            "JEFF_MOOD_MAX_HOURS": "24",
+            "JEFF_MOOD_MAX_CHARS": "500",
+        }
+    )
+    assert cfg.mood_enabled is True
+    assert cfg.mood_default_hours == 4
+    assert cfg.mood_max_hours == 24
+    assert cfg.mood_max_chars == 500
+
+
+def test_remember_defaults_off():
+    cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
+    assert cfg.remember_enabled is False
+    assert cfg.remember_max_items == 20
+    assert cfg.remember_max_chars == 2000
+
+
+def test_remember_overrides_parsed():
+    cfg = Config.from_env(
+        {
+            "JEFF_DB_URL": "postgresql://x",
+            "JEFF_REMEMBER_ENABLED": "true",
+            "JEFF_REMEMBER_MAX_ITEMS": "10",
+            "JEFF_REMEMBER_MAX_CHARS": "500",
+        }
+    )
+    assert cfg.remember_enabled is True
+    assert cfg.remember_max_items == 10
+    assert cfg.remember_max_chars == 500
 
 
 def test_search_url_and_auth_parsed():

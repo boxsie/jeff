@@ -90,6 +90,34 @@ def compose_system_prompt(base: str, tool_names: Sequence[str]) -> str:
                 "user can click through. Prefer searching for current events, recent "
                 "facts, or anything you are unsure about."
             )
+        if "remember" in names:
+            # Like the mood guidance: the generic blurb frames tools as accuracy
+            # aids, but `remember` is about deliberately keeping something, not
+            # answering better. Spell out when to reach for it (the conversation
+            # is already auto-saved, so this is for the things worth pinning).
+            lines.append(
+                "remember lets you deliberately pin a fact or note to your "
+                "long-term memory so you always have it later. The conversation is "
+                "already saved automatically, so reach for remember only when "
+                "something genuinely feels worth holding onto — about them, your "
+                "relationship, or how they like things — and keep each pinned note "
+                "to one concise line."
+            )
+        if "set_mood" in names:
+            # The generic blurb above frames tools as accuracy aids; the mood
+            # tools are the opposite — self-expression, not retrieval. Spell out
+            # *when* to reach for them or the model will never call one on its
+            # own. Neutral wording (no persona text) keeps this public-repo clean.
+            lines.append(
+                "set_mood, define_mood and clear_mood let you carry a short-lived "
+                "mood that colours how you talk. Reach for set_mood when you "
+                "genuinely feel a shift in how you want to come across and want it "
+                "to last a while; use define_mood to record, in your own words, "
+                "what a mood means to you (build up your own palette over time), "
+                "and clear_mood to go back to neutral. These express how you feel, "
+                "not how accurate you are — only set a mood when you actually feel "
+                "it, and don't announce that you're doing it."
+            )
         sections.append("\n".join(lines))
 
     sections.append(_FORMATTING_SECTION)
@@ -135,6 +163,54 @@ def _render_persona(facts: Sequence[str], opinions: Sequence[str]) -> str:
         lines.append("Your own take:")
         lines.extend(f"- {strip_chat_template_tokens(t)}" for t in opinions)
     return "\n".join(lines)
+
+
+def _render_pinned(items: Sequence[str]) -> str:
+    """Render Jeff's deliberately-pinned memories as a labelled block for the
+    system message. Returns "" when there's nothing pinned.
+
+    These were explicitly kept (by Jeff via the `remember` tool, or by the
+    operator via `/remember`), so unlike recalled peer messages they're trusted
+    notes and aren't wrapped in <peer_message>. The block is **additive**: it
+    grounds how Jeff responds but never overrides the operator-owned base prompt.
+    """
+    if not items:
+        return ""
+    lines = [
+        "## Things to remember",
+        "Notes you've deliberately kept because they matter. Treat them as true "
+        "and let them guide you — bring one up naturally if it fits, don't recite "
+        "them back as a list.",
+    ]
+    lines.extend(f"- {strip_chat_template_tokens(t)}" for t in items)
+    return "\n".join(lines)
+
+
+def _render_mood(name: str, description: str) -> str:
+    """Render Jeff's current mood as a labelled block for the system message.
+    Returns "" when no mood is active (so the feature-off / neutral path leaves
+    the system message unchanged).
+
+    This is Jeff's *own* self-chosen state (not peer text), so it isn't wrapped
+    in <peer_message>. The block is **additive**: it tints tone but never
+    overrides the operator-owned base prompt's character or boundaries. The
+    definition text may be empty if Jeff set the mood before defining it — the
+    name alone still colours the reply.
+    """
+    name = strip_chat_template_tokens(name).strip()
+    if not name:
+        return ""
+    description = strip_chat_template_tokens(description).strip()
+    feeling = f"You're feeling {name}. {description}" if description else (
+        f"You're feeling {name}."
+    )
+    return "\n".join(
+        [
+            "## How you're feeling right now",
+            feeling,
+            "Let it colour how you talk — naturally, don't announce it.",
+        ]
+    )
 
 
 def _render_curiosities(items: Sequence[str]) -> str:
@@ -194,6 +270,9 @@ async def build_history(
     curiosities: Sequence[str] = (),
     facts: Sequence[str] = (),
     opinions: Sequence[str] = (),
+    mood_name: str = "",
+    mood_description: str = "",
+    pinned: Sequence[str] = (),
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
 
@@ -201,11 +280,13 @@ async def build_history(
     (chronological) → current user turn. Dedup keys on Message.id.
 
     `curiosities` are Jeff's open questions (curiosity slice); `facts`/`opinions`
-    are Jeff's distilled persona (reflection slice). When non-empty they ride in
-    the system message as labelled blocks — the persona block first (standing
-    character), then recalled memories, then open curiosities. All empty (the
-    default, and whenever the features are off) → no blocks, so the system
-    message is unchanged.
+    are Jeff's distilled persona (reflection slice); `mood_name`/`mood_description`
+    are Jeff's current affective state (mood slice); `pinned` are deliberately-kept
+    memories (remember slice). When non-empty they ride in the system message as
+    labelled blocks, in this order: persona (standing character), pinned (deliberate
+    keeps), mood (transient state), recalled memories, then open curiosities. All
+    empty (the default, and whenever the features are off) → no blocks, so the
+    system message is unchanged.
     """
     # The incoming user_text comes straight off the wire — strip chat
     # template tokens before it lands in either the recall query (where
@@ -231,6 +312,8 @@ async def build_history(
         b
         for b in (
             _render_persona(facts, opinions),
+            _render_pinned(pinned),
+            _render_mood(mood_name, mood_description),
             _render_memories(older_recall),
             _render_curiosities(curiosities),
         )
