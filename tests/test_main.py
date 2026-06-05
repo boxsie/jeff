@@ -8,7 +8,7 @@ import pytest
 from jeff.chat_types import ChatResult, ToolCall
 from jeff.config import Config
 from jeff.dispatch import DispatchPolicy, TurnDispatcher
-from jeff.main import _drain_events, handle_turn
+from jeff.main import _TURN_FAILED_MESSAGE, _drain_events, handle_turn
 from jeff.memory import MAX_CONTENT_BYTES, Memory
 from jeff.tools import ToolRegistry
 from jeff.tools.builtins import GetTimeTool
@@ -605,8 +605,67 @@ async def test_handle_turn_swallows_exceptions():
     await handle_turn(handle, memory, BoomOllama(), cfg, "EpeerD", "ping")
     # User turn still got remembered before the failure.
     assert ("EpeerD", "user", "ping") in memory.remembered
-    # No assistant message stored, no send.
-    assert handle.sent == []
+    # No assistant message stored (the failed reply isn't a real turn), but the
+    # peer DOES get a graceful, content-safe apology instead of silence.
+    assert ("EpeerD", "assistant", _TURN_FAILED_MESSAGE) not in memory.remembered
+    assert handle.sent == [("EpeerD", _TURN_FAILED_MESSAGE)]
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_failure_reply_never_leaks_exception_text():
+    """The graceful apology must carry nothing from the exception — the exc
+    string can embed peer-shaped Ollama response bodies (ollama._safe_excerpt)."""
+    sentinel = "PEER_CONTROLLED_PAYLOAD_DO_NOT_LEAK"
+
+    class BoomOllama:
+        async def chat(self, messages, *, model):
+            raise RuntimeError(sentinel)
+
+        async def embed(self, text, *, model):
+            return [0.0] * 4
+
+    handle = FakeHandle()
+    memory = FakeMemory()
+    cfg = _cfg()
+
+    await handle_turn(handle, memory, BoomOllama(), cfg, "EpeerD", "ping")
+
+    assert len(handle.sent) == 1
+    _, reply = handle.sent[0]
+    assert reply == _TURN_FAILED_MESSAGE
+    assert sentinel not in reply
+    assert "RuntimeError" not in reply
+
+
+@pytest.mark.asyncio
+async def test_handle_turn_swallows_send_failure_during_error_path(caplog):
+    """If even the failure-reply send raises, it's logged and never escapes the
+    handler — failure-handling can't itself crash the event loop."""
+    import logging
+
+    class BoomOllama:
+        async def chat(self, messages, *, model):
+            raise RuntimeError("primary failure")
+
+        async def embed(self, text, *, model):
+            return [0.0] * 4
+
+    class BoomSendHandle(FakeHandle):
+        async def send_message(self, to_addr, text):
+            raise RuntimeError("transport down too")
+
+    handle = BoomSendHandle()
+    memory = FakeMemory()
+    cfg = _cfg()
+
+    with caplog.at_level(logging.DEBUG, logger="jeff"):
+        # Must not raise even though both the turn AND the apology send fail.
+        await handle_turn(handle, memory, BoomOllama(), cfg, "EpeerD", "ping")
+
+    # Nothing escaped; the send failure was reported on the operator log.
+    assert any(
+        "failed to send turn-failure reply" in r.getMessage() for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio

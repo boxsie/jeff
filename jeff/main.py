@@ -36,6 +36,13 @@ _TOOL_CAP_MESSAGE = (
     "Could you try rephrasing or narrowing the request?"
 )
 
+# Sent to the peer when a turn raises (provider timeout, DB fault, …) so Jeff
+# reports the glitch in-character instead of going silent. Deliberately generic:
+# the exception string may embed an Ollama response body shaped by peer prompts
+# (see ollama._safe_excerpt), so NOTHING from the exception goes on the wire —
+# only this canned, content-safe line. The operator log line keeps the type name.
+_TURN_FAILED_MESSAGE = "Sorry — I glitched out on that one. Give me another go in a bit?"
+
 
 def _pack_pinned(rows: list[Pinned], max_chars: int) -> list[str]:
     """Pack pinned-memory texts into the prompt block within a char budget.
@@ -192,6 +199,15 @@ async def handle_turn(
         # ollama._safe_excerpt) and don't log the traceback (it embeds the
         # same string via __cause__). One operator-readable line, no PII.
         log.error("turn failed peer=%s exc=%s", peer, type(e).__name__)
+        # Don't leave the peer in silence — send a generic, content-safe apology
+        # so a failed turn looks like a glitch, not a dead Jeff. Mirrors the
+        # oversize-reject path: the reply carries NOTHING from the exception, and
+        # the send is wrapped on its own so a failure here can't escape the
+        # handler (the dispatcher would otherwise log it a second time).
+        try:
+            await handle.send_message(peer, _TURN_FAILED_MESSAGE)
+        except Exception:
+            log.exception("failed to send turn-failure reply to peer=%s", peer)
 
 
 def _assistant_tool_message(result: ChatResult) -> dict:
