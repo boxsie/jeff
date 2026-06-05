@@ -211,6 +211,11 @@ class Config:
     remember_max_items: int
     remember_max_chars: int
 
+    appraisal_enabled: bool
+    appraisal_every_turns: int
+    drive_decay_half_life_hours: float
+    drives_max_chars: int
+
     max_inflight: int
     per_peer_concurrency: int
     peer_rate_per_minute: float
@@ -334,6 +339,19 @@ class Config:
             remember_enabled=_parse_bool(e.get("JEFF_REMEMBER_ENABLED", "false")),
             remember_max_items=int(e.get("JEFF_REMEMBER_MAX_ITEMS", "20")),
             remember_max_chars=int(e.get("JEFF_REMEMBER_MAX_CHARS", "2000")),
+            # Appraisal / reward (motivation-system slice 3) — default OFF: when
+            # off the store/driver are never built, so behaviour is byte-identical.
+            # This is the feedback edge that closes the motivation loop — a
+            # post-turn pass rates each exchange and nudges the standing drives,
+            # which decay toward their baseline with the configured half-life. The
+            # drive set + per-drive baselines are a constant registry in
+            # appraisal.py (adding a drive is one line, not an env knob).
+            appraisal_enabled=_parse_bool(e.get("JEFF_APPRAISAL_ENABLED", "false")),
+            appraisal_every_turns=int(e.get("JEFF_APPRAISAL_EVERY_TURNS", "1")),
+            drive_decay_half_life_hours=float(
+                e.get("JEFF_DRIVE_DECAY_HALF_LIFE_HOURS", "24")
+            ),
+            drives_max_chars=int(e.get("JEFF_DRIVES_MAX_CHARS", "2000")),
             max_inflight=int(e.get("JEFF_MAX_INFLIGHT", "32")),
             per_peer_concurrency=int(e.get("JEFF_PER_PEER_CONCURRENCY", "1")),
             peer_rate_per_minute=float(e.get("JEFF_PEER_RATE_PER_MINUTE", "6")),

@@ -9,6 +9,7 @@ import signal
 import ensemble
 from psycopg_pool import AsyncConnectionPool
 
+from .appraisal import DRIVES, AppraisalDriver, DriveState
 from .commands import CommandContext, CommandRegistry, build_command_registry
 from .config import Config
 from .curiosity import CuriosityDriver, CuriosityStore
@@ -77,6 +78,8 @@ async def handle_turn(
     reflector: "Reflector | None" = None,
     mood_store: "MoodStore | None" = None,
     pinned_store: "PinnedMemoryStore | None" = None,
+    drive_store: "DriveState | None" = None,
+    appraisal_driver: "AppraisalDriver | None" = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -154,6 +157,19 @@ async def handle_turn(
             except Exception as e:
                 log.error("pinned fetch failed peer=%s exc=%s", peer, type(e).__name__)
 
+        # Jeff's current drive balance for this peer — surfaced into the prompt's
+        # "## Your drives right now" block. Best-effort + additive: a store read
+        # fault must never break the reply, so fall back to no block. Levels are
+        # decayed-to-now in the store; here we just pair each drive's prose noun
+        # with its current level for the renderer.
+        drives: list[tuple[str, float]] = []
+        if drive_store is not None:
+            try:
+                levels = await drive_store.levels(peer)
+                drives = [(d.noun, levels[d.key]) for d in DRIVES]
+            except Exception as e:
+                log.error("drives fetch failed peer=%s exc=%s", peer, type(e).__name__)
+
         # Build the prompt BEFORE persisting the current user message.
         # build_history appends the current turn explicitly; if we stored it
         # first, recent()/recall() would also return it and the message would
@@ -173,6 +189,8 @@ async def handle_turn(
             mood_name=mood_name,
             mood_description=mood_description,
             pinned=pinned,
+            drives=drives,
+            drives_max_chars=cfg.drives_max_chars,
         )
         # Persist after building but before the model call, so the user turn is
         # still recorded even if the chat/tool call fails (matches prior behaviour).
@@ -193,6 +211,12 @@ async def handle_turn(
         # raises, so it can't delay or break the turn that already sent its reply.
         if reflector is not None:
             await reflector.maybe_reflect(peer)
+        # Fire-and-forget: appraise this exchange against Jeff's drives and nudge
+        # their levels — the feedback edge that closes the motivation loop.
+        # maybe_appraise never blocks (spawns) and never raises, so it can't delay
+        # or break the turn that already sent its reply.
+        if appraisal_driver is not None:
+            await appraisal_driver.maybe_appraise(peer, text, reply)
     except Exception as e:
         # Deliberately structured: don't log the exception message (it may
         # contain Ollama response body shaped by peer prompts — see
@@ -409,6 +433,27 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("reflection disabled")
 
+            # Appraisal / reward drive (motivation slice 3) — default OFF. Built
+            # only when enabled so the disabled path makes no extra DB/LLM calls
+            # and stays byte-identical. Plain Postgres (no embedder) — a drive
+            # level is a scalar, not a semantic set. The store backs the per-turn
+            # drive-balance fetch + /mind; the driver runs the fire-and-forget
+            # post-turn appraisal pass that nudges the levels.
+            drive_store: DriveState | None = None
+            appraisal_driver: AppraisalDriver | None = None
+            if cfg.appraisal_enabled:
+                drive_store = await DriveState.create(
+                    pool, half_life_hours=cfg.drive_decay_half_life_hours
+                )
+                appraisal_driver = AppraisalDriver(drive_store, chat_provider, cfg)
+                log.info(
+                    "appraisal enabled (appraise every %d turn(s), decay half-life %g h)",
+                    cfg.appraisal_every_turns,
+                    cfg.drive_decay_half_life_hours,
+                )
+            else:
+                log.info("appraisal disabled")
+
             # Registry built AFTER the stores so the mood tools can be wired to
             # the mood store. Empty when tools are off → the no-tools turn path.
             registry = build_registry(
@@ -438,6 +483,7 @@ async def run(cfg: Config) -> None:
                     reflection_enabled=cfg.reflection_enabled,
                     mood_enabled=cfg.mood_enabled,
                     remember_enabled=cfg.remember_enabled,
+                    appraisal_enabled=cfg.appraisal_enabled,
                 )
                 if cfg.commands_enabled
                 else None
@@ -487,6 +533,8 @@ async def run(cfg: Config) -> None:
                             reflector,
                             mood_store,
                             pinned_store,
+                            drive_store,
+                            appraisal_driver,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
@@ -504,6 +552,7 @@ async def run(cfg: Config) -> None:
                             reflection_store,
                             mood_store,
                             pinned_store,
+                            drive_store,
                         ),
                         name="jeff-events",
                     )
@@ -523,6 +572,8 @@ async def run(cfg: Config) -> None:
                         await curiosity_driver.aclose()
                     if reflector is not None:
                         await reflector.aclose()
+                    if appraisal_driver is not None:
+                        await appraisal_driver.aclose()
     finally:
         await pool.close()
 
@@ -539,6 +590,7 @@ async def _handle_command(
     reflection_store: "ReflectionStore | None" = None,
     mood_store: "MoodStore | None" = None,
     pinned_store: "PinnedMemoryStore | None" = None,
+    drive_store: "DriveState | None" = None,
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -563,6 +615,7 @@ async def _handle_command(
         reflection=reflection_store,
         mood=mood_store,
         pinned=pinned_store,
+        drives=drive_store,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -583,6 +636,7 @@ async def _drain_events(
     reflection_store: "ReflectionStore | None" = None,
     mood_store: "MoodStore | None" = None,
     pinned_store: "PinnedMemoryStore | None" = None,
+    drive_store: "DriveState | None" = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
@@ -609,6 +663,7 @@ async def _drain_events(
                 reflection_store,
                 mood_store,
                 pinned_store,
+                drive_store,
             )
             continue
         if not isinstance(event, ensemble.ChatMessage):

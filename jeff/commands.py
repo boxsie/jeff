@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     import ensemble
 
+    from .appraisal import DriveState
     from .config import Config
     from .curiosity import CuriosityStore
     from .memory import Memory, Message
@@ -90,6 +91,7 @@ class CommandContext:
     reflection: "ReflectionStore | None" = None
     mood: "MoodStore | None" = None
     pinned: "PinnedMemoryStore | None" = None
+    drives: "DriveState | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -212,6 +214,10 @@ async def _cmd_forget(ctx: CommandContext) -> str:
     # Deliberately-pinned memories are wiped too — a clean slate is clean.
     if ctx.pinned is not None:
         await ctx.pinned.forget(ctx.peer)
+    # Drive levels are part of the relationship too (they're nudged by these very
+    # conversations); wipe them so they reset to baseline on a clean slate.
+    if ctx.drives is not None:
+        await ctx.drives.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -383,6 +389,16 @@ def _format_remaining(seconds: float) -> str:
     return " ".join(parts) + " left"
 
 
+def _drive_band(level: float) -> str:
+    """One-word band for a drive level in the `/mind` dump (matches the prompt
+    block's thresholds so the operator view and what Jeff sees stay aligned)."""
+    if level >= 0.62:
+        return "well-met"
+    if level <= 0.38:
+        return "running low"
+    return "steady"
+
+
 async def _mood_line(ctx: CommandContext) -> str:
     """One-line description of the active mood (or neutral), shared by `/mood`
     and the `/mind` mood section. Computes 'time left' from the DB expiry against
@@ -446,10 +462,11 @@ async def _cmd_mind(ctx: CommandContext) -> str:
         and ctx.reflection is None
         and ctx.mood is None
         and ctx.pinned is None
+        and ctx.drives is None
     ):
         return (
-            "None of curiosity, reflection, moods, or pinned memory is switched on "
-            "right now, so there's nothing on my mind to show."
+            "None of curiosity, reflection, moods, pinned memory, or drives is "
+            "switched on right now, so there's nothing on my mind to show."
         )
 
     sections: list[str] = []
@@ -476,6 +493,19 @@ async def _cmd_mind(ctx: CommandContext) -> str:
             lines.extend(f"  • {d.name}: {_truncate(d.description)}" for d in defs)
         else:
             lines.append("  (no moods defined yet — we author them together)")
+        sections.append("\n".join(lines))
+
+    if ctx.drives is not None:
+        from .appraisal import DRIVES
+
+        levels = await ctx.drives.levels(ctx.peer)
+        lines = ["drives:"]
+        # Show each drive's decayed-to-now level plus a one-word band, so the
+        # operator can see the balance the appraisal pass is steering.
+        lines.extend(
+            f"  • {d.noun}: {levels[d.key]:.2f} ({_drive_band(levels[d.key])})"
+            for d in DRIVES
+        )
         sections.append("\n".join(lines))
 
     if ctx.curiosity is not None:
@@ -518,13 +548,15 @@ def build_command_registry(
     reflection_enabled: bool = False,
     mood_enabled: bool = False,
     remember_enabled: bool = False,
+    appraisal_enabled: bool = False,
 ) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
 
-    `/mind` is declared when any of curiosity / reflection / mood / remember is
-    on; `/mood` only when the mood drive is on; `/remember` only when the remember
-    drive is on — keeping the feature-off path's declared command set unchanged."""
+    `/mind` is declared when any of curiosity / reflection / mood / remember /
+    appraisal is on; `/mood` only when the mood drive is on; `/remember` only when
+    the remember drive is on — keeping the feature-off path's declared command set
+    unchanged."""
     cmds = [
         Command(
             "clear",
@@ -545,7 +577,13 @@ def build_command_registry(
             usage="[prompt|recall <query>]",
         ),
     ]
-    if curiosity_enabled or reflection_enabled or mood_enabled or remember_enabled:
+    if (
+        curiosity_enabled
+        or reflection_enabled
+        or mood_enabled
+        or remember_enabled
+        or appraisal_enabled
+    ):
         cmds.append(
             Command("mind", "show what's on my mind right now", _cmd_mind)
         )

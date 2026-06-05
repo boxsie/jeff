@@ -213,6 +213,65 @@ def _render_mood(name: str, description: str) -> str:
     )
 
 
+def _render_drives(states: Sequence[tuple[str, float]], *, max_chars: int = 2000) -> str:
+    """Render Jeff's current drive balance as a labelled block for the system
+    message. Returns "" when there's nothing to show.
+
+    `states` is an ordered ``(noun, level)`` list — the decayed-to-now level of
+    each standing drive in ``[0, 1]`` (see ``appraisal.DriveState``). This is
+    Jeff's *own* continuous inner state (not peer text), so it isn't wrapped in
+    <peer_message>, and like every inner-life block it's **additive**: it nudges
+    how Jeff shows up but never overrides the operator-owned base prompt.
+
+    Rendered as a short, natural-language self-state — NOT a list to recite back —
+    so it colours tone rather than being narrated. Bands: a level is "well-met"
+    near the top, "running low" near the bottom, and unremarkable in the middle;
+    only the notable ends are mentioned so the line stays a nudge, not a readout.
+
+    Design note (kept here on purpose): this is deliberately distinct from the
+    mood block. A mood is a discrete, time-boxed, Jeff-authored *episode* ("today
+    I'm playful"); drives are the underlying *continuous* deficiency state that an
+    appraisal pass nudges every turn. They're separate blocks for v1; the natural
+    bridge — a strong appraisal *setting* a transient mood — is a deliberate
+    follow-on, not wired here (it would couple the appraisal writer to the mood
+    store).
+    """
+    if not states:
+        return ""
+    high = [noun for noun, level in states if level >= 0.62]
+    low = [noun for noun, level in states if level <= 0.38]
+    if not high and not low:
+        sentence = (
+            "Right now your inner drives are all sitting in a comfortable middle — "
+            "nothing pulling strongly either way."
+        )
+    else:
+        parts: list[str] = []
+        if high:
+            parts.append(f"feeling well-met on {_join_nouns(high)}")
+        if low:
+            parts.append(f"running a little low on {_join_nouns(low)}")
+        sentence = "Right now you're " + ", but ".join(parts) + "."
+    block = "\n".join(
+        [
+            "## Your drives right now",
+            sentence,
+            "Let it colour how you show up — naturally, don't announce it.",
+        ]
+    )
+    return block[:max_chars]
+
+
+def _join_nouns(nouns: Sequence[str]) -> str:
+    """Join nouns into 'a', 'a and b', or 'a, b and c' for the drives prose."""
+    nouns = list(nouns)
+    if len(nouns) == 1:
+        return nouns[0]
+    if len(nouns) == 2:
+        return f"{nouns[0]} and {nouns[1]}"
+    return ", ".join(nouns[:-1]) + f" and {nouns[-1]}"
+
+
 def _render_curiosities(items: Sequence[str]) -> str:
     """Render Jeff's open questions as a labelled block for the system message.
     Returns "" when there's nothing to show.
@@ -273,6 +332,8 @@ async def build_history(
     mood_name: str = "",
     mood_description: str = "",
     pinned: Sequence[str] = (),
+    drives: Sequence[tuple[str, float]] = (),
+    drives_max_chars: int = 2000,
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
 
@@ -282,11 +343,13 @@ async def build_history(
     `curiosities` are Jeff's open questions (curiosity slice); `facts`/`opinions`
     are Jeff's distilled persona (reflection slice); `mood_name`/`mood_description`
     are Jeff's current affective state (mood slice); `pinned` are deliberately-kept
-    memories (remember slice). When non-empty they ride in the system message as
-    labelled blocks, in this order: persona (standing character), pinned (deliberate
-    keeps), mood (transient state), recalled memories, then open curiosities. All
-    empty (the default, and whenever the features are off) → no blocks, so the
-    system message is unchanged.
+    memories (remember slice); `drives` are the current decayed drive levels as
+    `(noun, level)` pairs (appraisal slice). When non-empty they ride in the system
+    message as labelled blocks, in this order: persona (standing character), pinned
+    (deliberate keeps), mood (transient episode), drives (continuous inner state,
+    sat next to mood), recalled memories, then open curiosities. All empty (the
+    default, and whenever the features are off) → no blocks, so the system message
+    is unchanged.
     """
     # The incoming user_text comes straight off the wire — strip chat
     # template tokens before it lands in either the recall query (where
@@ -314,6 +377,7 @@ async def build_history(
             _render_persona(facts, opinions),
             _render_pinned(pinned),
             _render_mood(mood_name, mood_description),
+            _render_drives(drives, max_chars=drives_max_chars),
             _render_memories(older_recall),
             _render_curiosities(curiosities),
         )

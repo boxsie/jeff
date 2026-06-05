@@ -13,6 +13,7 @@ import sys
 
 from psycopg_pool import AsyncConnectionPool
 
+from .appraisal import DriveState
 from .config import Config, ConfigError
 from .curiosity import CuriosityStore
 from .main import run as _run
@@ -119,9 +120,14 @@ async def _reset_memory(cfg: Config) -> None:
             await mood.reset()
             pinned = PinnedMemoryStore(pool)
             await pinned.reset()
+            # Drive state is a plain table (no embedding) too — unaffected by a
+            # dimension change, but "clean slate" means drop and recreate it.
+            drives = DriveState(pool, half_life_hours=cfg.drive_decay_half_life_hours)
+            await drives.reset()
             print(
                 f"memory reset — messages + curiosities + derived_memory + mood + "
-                f"pinned schema recreated at dim={cfg.embed_dim} (model={cfg.embed_model})"
+                f"pinned + drive_state schema recreated at dim={cfg.embed_dim} "
+                f"(model={cfg.embed_model})"
             )
     finally:
         await pool.close()

@@ -171,6 +171,7 @@ def _ctx(
     curiosity=None,
     reflection=None,
     pinned=None,
+    drives=None,
 ) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
@@ -183,6 +184,7 @@ def _ctx(
         curiosity=curiosity,
         reflection=reflection,
         pinned=pinned,
+        drives=drives,
     )
 
 
@@ -540,6 +542,56 @@ async def test_forget_yes_also_wipes_pinned_store():
     store = FakePinnedStore(pins=[_Pin("x")])
     reply = await build_command_registry().dispatch(
         "forget", _ctx(memory=mem, args="yes", pinned=store)
+    )
+    assert mem.forgotten == ["EpeerD"]
+    assert store.forgotten == ["EpeerD"]
+    assert "clean slate" in reply.lower()
+
+
+# --- appraisal drive: /mind drives + /forget wiring ------------------------
+
+
+class FakeDriveStore:
+    """In-memory stand-in for DriveState that records /forget + serves /mind."""
+
+    def __init__(self, levels=None):
+        self._levels = levels or {"connection": 0.8, "novelty": 0.2,
+                                  "competence": 0.5, "autonomy": 0.5}
+        self.forgotten: list[str] = []
+
+    async def levels(self, peer):
+        return dict(self._levels)
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return len(self._levels)
+
+
+def test_mind_declared_when_only_appraisal_enabled():
+    # Appraisal alone is enough to surface /mind (the others off).
+    reg = build_command_registry(appraisal_enabled=True)
+    assert reg.get("mind") is not None
+    assert "mind" in reg.names()
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_drive_balance_with_bands():
+    store = FakeDriveStore()
+    reg = build_command_registry(appraisal_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(drives=store))
+    assert "drives:" in reply.lower()
+    # Each drive shows its level + a one-word band aligned with the prompt block.
+    assert "connection: 0.80 (well-met)" in reply
+    assert "novelty: 0.20 (running low)" in reply
+    assert "competence: 0.50 (steady)" in reply
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_drive_store():
+    mem = FakeMemory()
+    store = FakeDriveStore()
+    reply = await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", drives=store)
     )
     assert mem.forgotten == ["EpeerD"]
     assert store.forgotten == ["EpeerD"]

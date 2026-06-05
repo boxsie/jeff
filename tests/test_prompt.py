@@ -195,6 +195,42 @@ async def test_build_history_injects_curiosity_block_when_present():
 
 
 @pytest.mark.asyncio
+async def test_build_history_injects_drives_block_when_present():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        drives=[("connection", 0.8), ("novelty", 0.2), ("competence", 0.5)],
+    )
+    sys_msg = history[0]
+    assert sys_msg["role"] == "system"
+    assert sys_msg["content"].startswith(SYSTEM_PROMPT)
+    assert "## Your drives right now" in sys_msg["content"]
+    assert "well-met on connection" in sys_msg["content"]
+    assert "running a little low on novelty" in sys_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_build_history_no_drives_block_when_empty():
+    # Empty drives (the default, and whenever appraisal is off) → the system
+    # message is the prompt verbatim, byte-identical to before the feature.
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        drives=[],
+    )
+    assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert "## Your drives right now" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
 async def test_build_history_no_curiosity_block_when_empty():
     # Empty curiosities (the default, and whenever the drive is off) → the system
     # message is the prompt verbatim, byte-identical to before the feature.
