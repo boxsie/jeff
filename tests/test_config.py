@@ -26,8 +26,6 @@ def test_from_env_defaults():
 def test_proactive_disabled_by_default():
     cfg = Config.from_env({"JEFF_DB_URL": "postgresql://x"})
     assert cfg.proactive_enabled is False
-    assert cfg.proactive_interval_s == 300
-    assert cfg.proactive_connection_threshold == 0.35
     assert cfg.proactive_min_gap_s == 1800
     assert cfg.proactive_presence_ttl_s == 3600
 
@@ -37,15 +35,11 @@ def test_proactive_flags_parse():
         {
             "JEFF_DB_URL": "postgresql://x",
             "JEFF_PROACTIVE_ENABLED": "true",
-            "JEFF_PROACTIVE_INTERVAL_S": "120",
-            "JEFF_PROACTIVE_CONNECTION_THRESHOLD": "0.5",
             "JEFF_PROACTIVE_MIN_GAP_S": "600",
             "JEFF_PROACTIVE_PRESENCE_TTL_S": "1800",
         }
     )
     assert cfg.proactive_enabled is True
-    assert cfg.proactive_interval_s == 120
-    assert cfg.proactive_connection_threshold == 0.5
     assert cfg.proactive_min_gap_s == 600
     assert cfg.proactive_presence_ttl_s == 1800
 

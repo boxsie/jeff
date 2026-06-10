@@ -224,8 +224,6 @@ class Config:
     drives_max_chars: int
 
     proactive_enabled: bool
-    proactive_interval_s: float
-    proactive_connection_threshold: float
     proactive_min_gap_s: float
     proactive_presence_ttl_s: float
 
@@ -410,18 +408,14 @@ class Config:
                 e.get("JEFF_DRIVE_DECAY_HALF_LIFE_HOURS", "24")
             ),
             drives_max_chars=int(e.get("JEFF_DRIVES_MAX_CHARS", "2000")),
-            # Proactive autonomy loop (motivation slice 4) — default OFF: when off
-            # the store/loop are never built, so behaviour is byte-identical. Needs
-            # appraisal (the connection-pressure signal) AND curiosity (the
-            # candidates) enabled to do anything; otherwise the loop is inert. The
-            # timer paces *checking* (interval); a reach-out also needs connection
-            # under the threshold, the operator present within the TTL, past the
-            # min-gap fuse, and something new to say. See proactive.py.
+            # Proactive messaging (motivation slice 4) — default OFF: when off the
+            # store + the reach_out verb are never built. It's no longer a separate
+            # loop: reaching out is a verb the self-turn wields (selfturn.py), so
+            # this needs JEFF_SELF_TURN_ENABLED on to do anything. These two knobs
+            # are the door-to-the-operator gate the reach_out tool enforces: the
+            # min-gap fuse, and how recently the operator must have been seen
+            # (presence TTL) to count as reachable. Mute is runtime via /mute.
             proactive_enabled=_parse_bool(e.get("JEFF_PROACTIVE_ENABLED", "false")),
-            proactive_interval_s=float(e.get("JEFF_PROACTIVE_INTERVAL_S", "300")),
-            proactive_connection_threshold=float(
-                e.get("JEFF_PROACTIVE_CONNECTION_THRESHOLD", "0.35")
-            ),
             proactive_min_gap_s=float(e.get("JEFF_PROACTIVE_MIN_GAP_S", "1800")),
             proactive_presence_ttl_s=float(
                 e.get("JEFF_PROACTIVE_PRESENCE_TTL_S", "3600")

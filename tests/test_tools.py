@@ -284,9 +284,36 @@ def test_build_self_turn_registry_has_inward_and_memory_tools():
     assert "remember" in names
     assert "recall_memory" in names
     assert "summarize_recent" in names
-    # Inward-only: no search, no get_time, no outbound message tool.
+    # No search, no get_time. No reach_out either — proactive wasn't enabled and
+    # no wire collaborators were supplied.
     assert "web_search" not in names
     assert "get_time" not in names
+    assert "reach_out" not in names
+
+
+def test_build_self_turn_registry_adds_reach_out_when_proactive_on():
+    from jeff.tools import build_self_turn_registry
+
+    reg = build_self_turn_registry(
+        _cfg(JEFF_SELF_TURN_ENABLED="true", JEFF_PROACTIVE_ENABLED="true"),
+        memory=object(),
+        handle=object(),
+        presence=object(),
+        proactive_store=object(),
+        curiosity_store=object(),
+    )
+    assert "reach_out" in reg.names()
+
+
+def test_build_self_turn_registry_omits_reach_out_without_collaborators():
+    from jeff.tools import build_self_turn_registry
+
+    # Proactive on but no handle/presence/store supplied → no outward verb.
+    reg = build_self_turn_registry(
+        _cfg(JEFF_SELF_TURN_ENABLED="true", JEFF_PROACTIVE_ENABLED="true"),
+        memory=object(),
+    )
+    assert "reach_out" not in reg.names()
 
 
 def test_build_self_turn_registry_empty_when_disabled():

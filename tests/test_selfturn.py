@@ -16,7 +16,11 @@ from typing import ClassVar
 import pytest
 
 from jeff.chat_types import ChatResult, ToolCall
-from jeff.selfturn import SelfTurnLoop
+from jeff.selfturn import (
+    _SELF_TURN_INSTRUCTION,
+    _SELF_TURN_INSTRUCTION_OUTWARD,
+    SelfTurnLoop,
+)
 from jeff.tools.base import Tool, ToolRegistry
 
 
@@ -24,6 +28,17 @@ _NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
 
 
 # --- fakes ------------------------------------------------------------------
+
+
+class _ReachStub(Tool):
+    """Stand-in named like the outward verb, to flip the instruction selection."""
+
+    name: ClassVar[str] = "reach_out"
+    description: ClassVar[str] = "reach out"
+    parameters: ClassVar[dict] = {"type": "object", "properties": {}, "required": []}
+
+    async def run(self, **kwargs) -> str:
+        return "ok"
 
 
 class RecordMoodTool(Tool):
@@ -234,6 +249,16 @@ async def test_runs_even_when_drive_off_baseline_only():
 
 
 # --- fault isolation --------------------------------------------------------
+
+
+def test_instruction_switches_on_reach_out_presence():
+    inward = _loop(registry=ToolRegistry([RecordMoodTool()]), provider=FakeProvider())
+    assert inward._instruction is _SELF_TURN_INSTRUCTION
+    outward = _loop(
+        registry=ToolRegistry([RecordMoodTool(), _ReachStub()]),
+        provider=FakeProvider(),
+    )
+    assert outward._instruction is _SELF_TURN_INSTRUCTION_OUTWARD
 
 
 @pytest.mark.asyncio

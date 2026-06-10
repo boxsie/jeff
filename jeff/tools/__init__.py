@@ -20,6 +20,7 @@ from .base import DEFAULT_TOOL_TIMEOUT_S, Tool, ToolRegistry
 from .builtins import GetTimeTool
 from .impulses import AdjustImpulseTool, ClearImpulseTool, SetImpulseTool
 from .mood import ClearMoodTool, DefineMoodTool, SetMoodTool
+from .reach import REACH_OUT_MAX_CHARS, ReachOutTool
 from .recall import (
     RECALL_MAX_CHARS,
     SUMMARIZE_SPAN,
@@ -153,11 +154,21 @@ def build_self_turn_registry(
     mood_store: MoodStore | None = None,
     pinned_store: PinnedMemoryStore | None = None,
     impulse_store: ImpulseStore | None = None,
+    handle=None,
+    presence=None,
+    proactive_store=None,
+    curiosity_store=None,
 ) -> ToolRegistry:
     """The registry the idle self-turn wields: Jeff's INWARD verbs (mood /
-    impulse / remember) plus the read-only memory-scan tools (recall /
-    summarize). Deliberately NO search (network/outward) and NO outbound message
-    tool — slice 1 is inward-only; the outward `reach_out` edge is a later slice.
+    impulse / remember) + the read-only memory-scan tools (recall / summarize),
+    plus the ONE outward verb `reach_out` when proactive messaging is enabled.
+
+    `reach_out` is added only when `cfg.proactive_enabled` AND the wire-bound
+    collaborators are supplied (`handle`, `presence`, `proactive_store`, plus a
+    `memory` for send bookkeeping). Its presence/min-gap/mute gate lives inside
+    the tool, so the loop still fires inward-only when the operator's offline —
+    the door to them is gated on the verb, not the loop. Search is never added
+    (network/outward, not inner life).
 
     Gated by `cfg.self_turn_enabled` (returns empty when off, so the loop is
     never built). Independent of `cfg.tools_enabled`: the self-turn is its own
@@ -175,4 +186,23 @@ def build_self_turn_registry(
             impulse_store=impulse_store,
         )
     )
+    if (
+        cfg.proactive_enabled
+        and handle is not None
+        and presence is not None
+        and proactive_store is not None
+        and memory is not None
+    ):
+        tools.append(
+            ReachOutTool(
+                handle,
+                proactive_store,
+                presence,
+                memory,
+                curiosity_store=curiosity_store,
+                min_gap_s=cfg.proactive_min_gap_s,
+                presence_ttl_s=cfg.proactive_presence_ttl_s,
+                max_chars=REACH_OUT_MAX_CHARS,
+            )
+        )
     return ToolRegistry(tools)

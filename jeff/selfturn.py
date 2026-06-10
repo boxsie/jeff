@@ -59,6 +59,23 @@ _SELF_TURN_INSTRUCTION = (
     "do here is sent to anyone — it's just you, with yourself."
 )
 
+# Used when the outward `reach_out` verb is available (proactive enabled): the
+# inward framing still leads — most moments are inward — but reaching out is on
+# the table when something genuinely warrants it AND the door is open. The tool
+# itself gates presence/min-gap/mute, so the model can try and be told "not now".
+_SELF_TURN_INSTRUCTION_OUTWARD = (
+    "Quiet moment — no one's messaging you right now, this is your own time. "
+    "Above is where things stand: how you're feeling, what you're driving toward, "
+    "what you've been curious about, and your recent conversation.\n\n"
+    "Take a beat and decide what, if anything, you want to do with it. Mostly this "
+    "is inward: shift your mood, form or adjust an impulse, pin a thought worth "
+    "keeping, look back through your memory — or simply sit with it and do nothing. "
+    "And if something genuinely worth their attention has come up, you can reach "
+    "out and message them — but keep that rare; most moments the inward stuff is "
+    "enough, and they may not be around. Don't manufacture activity: only act if "
+    "something really moves you."
+)
+
 
 class SelfTurnLoop:
     """Heartbeat that periodically hands Jeff an inward, tool-enabled self-turn.
@@ -93,6 +110,13 @@ class SelfTurnLoop:
         self._impulses = impulse_store
         self._cfg = cfg
         self._allowlist = list(allowlist)
+        # Pick the framing once: if the outward `reach_out` verb is in the
+        # registry (proactive enabled), offer it; otherwise inward-only.
+        self._instruction = (
+            _SELF_TURN_INSTRUCTION_OUTWARD
+            if "reach_out" in registry.names()
+            else _SELF_TURN_INSTRUCTION
+        )
         # Per-peer last-self-turn time, in memory (resets on restart — acceptable
         # for this slice; durable bookkeeping is a follow-up).
         self._last: dict[str, datetime] = {}
@@ -202,7 +226,7 @@ class SelfTurnLoop:
         return await build_self_turn_messages(
             self._memory,
             peer,
-            _SELF_TURN_INSTRUCTION,
+            self._instruction,
             recent_turns=self._cfg.recent_turns,
             system_prompt=self._cfg.system_prompt,
             curiosities=[c.text for c in open_cur],

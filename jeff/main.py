@@ -22,7 +22,7 @@ from .mood import MoodStore
 from .ollama import Ollama
 from .pinned import Pinned, PinnedMemoryStore
 from .presence import Presence
-from .proactive import ProactiveLoop, ProactiveStore
+from .proactive import ProactiveStore
 from .prompt import build_history, compose_system_prompt
 from .reflection import Reflector, ReflectionStore
 from .screen import screen_text
@@ -429,18 +429,15 @@ async def run(cfg: Config) -> None:
             if cfg.proactive_enabled:
                 proactive_store = await ProactiveStore.create(pool)
                 presence = Presence()
-                if not (cfg.appraisal_enabled and cfg.curiosity_enabled):
+                if not cfg.self_turn_enabled:
                     log.warning(
-                        "proactive enabled but appraisal=%s curiosity=%s — the loop "
-                        "stays inert until both are on",
-                        cfg.appraisal_enabled,
-                        cfg.curiosity_enabled,
+                        "proactive enabled but self-turn off — the reach_out verb is "
+                        "never wielded; enable JEFF_SELF_TURN_ENABLED for unprompted "
+                        "messages"
                     )
                 log.info(
-                    "proactive enabled (check every %gs, connection<%.2f, min-gap %gs, "
-                    "presence ttl %gs)",
-                    cfg.proactive_interval_s,
-                    cfg.proactive_connection_threshold,
+                    "proactive enabled (reach_out verb; min-gap %gs, presence ttl %gs, "
+                    "/mute)",
                     cfg.proactive_min_gap_s,
                     cfg.proactive_presence_ttl_s,
                 )
@@ -644,37 +641,16 @@ async def run(cfg: Config) -> None:
                     else:
                         log.info("signal front door disabled")
 
-                    # Proactive heartbeat (default off) — the consumer that turns
-                    # accrued state (curiosities, drive pressure) into unprompted
-                    # contact. Reaches out over the Ensemble handle to allowlisted
-                    # peers; presence is fed by the event drain below. (Signal-side
-                    # proactivity would need its own loop on the SignalHandle — a
-                    # future add; v1 reaches out over Ensemble only.)
-                    proactive_task: asyncio.Task | None = None
-                    if proactive_store is not None and presence is not None:
-                        proactive_loop = ProactiveLoop(
-                            handle,
-                            proactive_store,
-                            presence,
-                            memory,
-                            curiosity_store=curiosity_store,
-                            reflection_store=reflection_store,
-                            mood_store=mood_store,
-                            drive_store=drive_store,
-                            chat_provider=chat_provider,
-                            cfg=cfg,
-                            allowlist=cfg.allowlist,
-                        )
-                        proactive_task = asyncio.create_task(
-                            proactive_loop.run(), name="jeff-proactive"
-                        )
-
-                    # Idle self-turn (default off) — the inward agency loop: hands
-                    # Jeff a tool-enabled "what do I want to do?" turn on a cadence,
-                    # fired even when the operator is offline. Inward verbs only
-                    # (mood/impulse/remember + memory scan); no outbound message in
-                    # this slice. The inward registry is empty (→ loop inert) unless
-                    # self_turn is on AND at least one inward feature is enabled.
+                    # Idle self-turn (default off) — the agency loop: hands Jeff a
+                    # tool-enabled "what do I want to do?" turn on a cadence, fired
+                    # even when the operator is offline. Inward verbs (mood/impulse/
+                    # remember + memory scan) run regardless of presence; the one
+                    # outward verb, `reach_out`, is added when proactive messaging is
+                    # on and gates presence/min-gap/mute inside the tool (the door to
+                    # the operator). This replaces the retired ProactiveLoop
+                    # gatekeeper — one loop, the model reaches out by calling the
+                    # verb. Registry empty (→ loop inert) unless self_turn is on AND
+                    # at least one verb is available.
                     self_turn_task: asyncio.Task | None = None
                     if cfg.self_turn_enabled:
                         self_turn_registry = build_self_turn_registry(
@@ -684,11 +660,15 @@ async def run(cfg: Config) -> None:
                             mood_store=mood_store,
                             pinned_store=pinned_store,
                             impulse_store=impulse_store,
+                            handle=handle,
+                            presence=presence,
+                            proactive_store=proactive_store,
+                            curiosity_store=curiosity_store,
                         )
                         if len(self_turn_registry) == 0:
                             log.warning(
-                                "self-turn enabled but no inward verbs available "
-                                "(mood/remember/impulses all off) — loop will be inert"
+                                "self-turn enabled but no verbs available "
+                                "(mood/remember/impulses/proactive all off) — loop inert"
                             )
                         else:
                             log.info(
@@ -737,8 +717,6 @@ async def run(cfg: Config) -> None:
                     wait_set = {events_task, stop_task}
                     if signal_task is not None:
                         wait_set.add(signal_task)
-                    if proactive_task is not None:
-                        wait_set.add(proactive_task)
                     if self_turn_task is not None:
                         wait_set.add(self_turn_task)
                     done, pending = await asyncio.wait(
