@@ -95,6 +95,11 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_APPRAISAL_EVERY_TURNS` | `1` | Run the appraisal pass every N turns per peer (throttle the extra LLM call). |
 | `JEFF_DRIVE_DECAY_HALF_LIFE_HOURS` | `24` | Half-life (hours) for a drive level relaxing back toward its baseline. Decay is computed lazily at read time, no background loop. |
 | `JEFF_DRIVES_MAX_CHARS` | `2000` | Cap on the rendered "Your drives right now" prompt block. |
+| `JEFF_PROACTIVE_ENABLED` | `false` | Proactive messaging: a heartbeat that lets Jeff reach out **unprompted** when it genuinely has something to say. Most ticks are silent and cost nothing — the model is only consulted (as a silence-default gatekeeper) when the `connection` drive has decayed below the threshold *and* there's a concrete candidate (an open curiosity). **Needs `JEFF_APPRAISAL_ENABLED` (the pressure signal) and `JEFF_CURIOSITY_ENABLED` (the candidates) on** — inert otherwise. Reaches out over Ensemble only (not Signal, yet). Off ⇒ no extra store/loop (byte-identical to today). Adds `/mute`+`/unmute` and a proactive section to `/mind`. |
+| `JEFF_PROACTIVE_INTERVAL_S` | `300` | How often the loop wakes to *check* (not how often it messages — the gates decide that). |
+| `JEFF_PROACTIVE_CONNECTION_THRESHOLD` | `0.35` | Reach-out pressure bar: the loop only considers messaging when the `connection` drive has decayed below this (it rests low at 0.2 and is bumped up by warm exchanges, so this is "it's been a while"). |
+| `JEFF_PROACTIVE_MIN_GAP_S` | `1800` | Hard minimum gap between unprompted messages — an anti-machine-gun fuse, not a politeness cooldown. |
+| `JEFF_PROACTIVE_PRESENCE_TTL_S` | `3600` | How long after the operator's last inbound event Jeff still treats them as reachable. Generous so a reconnect-after-silence is the natural moment to reach out (the SDK has no transport-presence signal; recent activity is the proxy). |
 | `JEFF_SIGNAL_ENABLED` | `false` | Signal front door: a second inbound channel where you text Jeff's dedicated Signal number and it replies on the same thread, reusing the whole turn pipeline (memory, tools, drives). Off ⇒ no Signal client/loop (byte-identical to today). Needs a registered number + a running [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) in `json-rpc` mode. |
 | `JEFF_SIGNAL_API_URL` | `http://localhost:8080` | Base URL of the signal-cli-rest-api instance. Startup fails fast if Signal is enabled but this is empty. |
 | `JEFF_SIGNAL_NUMBER` | _empty_ | Jeff's own registered Signal number (E.164). **Required** when `JEFF_SIGNAL_ENABLED=true` (startup fails fast if missing). |
@@ -121,7 +126,9 @@ clears your local transcript while Jeff's leg resets its working memory window.
 | `/forget` | **Hard wipe** — permanently deletes every stored message for you. Irreversible, so it's confirm-gated: send `/forget yes` to actually wipe. Jeff-only; no daemon counterpart. |
 | `/stats` | Stored-message counts (you + all peers), process uptime, active provider/model, and system-prompt source. No secrets. |
 | `/debug` | Deterministic introspection of Jeff's working context: effective system prompt, session cutoff, recent window, and what recall would surface (with cosine distances). `/debug prompt` and `/debug recall <query>` for the detail views. |
-| `/mind` | What Jeff is curious about: open questions it wants to ask you, plus recently answered ones. Only declared when `JEFF_CURIOSITY_ENABLED` is on. |
+| `/mind` | What Jeff is curious about, its persona/mood/drives, and (when proactive is on) its reach-out state. Declared when any of curiosity / reflection / mood / remember / appraisal / proactive is on. |
+| `/mute` | Stop Jeff reaching out **unprompted** for a while (`/mute`, or `/mute 2h` / `30m` / `1d`). Reactive replies are unaffected. Only declared when `JEFF_PROACTIVE_ENABLED` is on. |
+| `/unmute` | Lift a `/mute` so Jeff can reach out again. Only declared when `JEFF_PROACTIVE_ENABLED` is on. |
 
 `/help` and `/whoami` are the daemon's built-ins (it aggregates every service's
 commands and reports node identity) — Jeff no longer declares them.

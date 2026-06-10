@@ -172,6 +172,7 @@ def _ctx(
     reflection=None,
     pinned=None,
     drives=None,
+    proactive=None,
 ) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
@@ -185,6 +186,7 @@ def _ctx(
         reflection=reflection,
         pinned=pinned,
         drives=drives,
+        proactive=proactive,
     )
 
 
@@ -596,3 +598,98 @@ async def test_forget_yes_also_wipes_drive_store():
     assert mem.forgotten == ["EpeerD"]
     assert store.forgotten == ["EpeerD"]
     assert "clean slate" in reply.lower()
+
+
+# --- proactive: /mute, /unmute, /mind section, /forget wipe ----------------
+
+
+class FakeProactiveStore:
+    """Stand-in for ProactiveStore: records mutes/forgets, returns a state."""
+
+    def __init__(self, *, muted_until=None, last_send_at=None):
+        from jeff.proactive import ProactiveState
+
+        self._state = ProactiveState("EpeerD", last_send_at, None, muted_until)
+        self.muted: list = []
+        self.forgotten: list[str] = []
+
+    async def get_state(self, peer):
+        return self._state
+
+    async def set_mute(self, peer, until):
+        self.muted.append((peer, until))
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return 1
+
+
+def test_mute_unmute_declared_only_when_proactive_enabled():
+    assert "mute" not in build_command_registry().names()
+    reg = build_command_registry(proactive_enabled=True)
+    assert "mute" in reg.names()
+    assert "unmute" in reg.names()
+    assert "mind" in reg.names()  # /mind lights up on proactive alone too
+
+
+@pytest.mark.asyncio
+async def test_mute_with_duration_sets_future_window():
+    from datetime import datetime, timezone
+
+    store = FakeProactiveStore()
+    reg = build_command_registry(proactive_enabled=True)
+    reply = await reg.dispatch("mute", _ctx(args="2h", proactive=store))
+    assert len(store.muted) == 1
+    peer, until = store.muted[0]
+    assert peer == "EpeerD"
+    delta = (until - datetime.now(timezone.utc)).total_seconds()
+    assert 7000 < delta < 7300  # ~2 hours out
+    assert "mut" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_mute_bare_uses_default_window():
+    store = FakeProactiveStore()
+    reg = build_command_registry(proactive_enabled=True)
+    await reg.dispatch("mute", _ctx(args="", proactive=store))
+    assert len(store.muted) == 1
+
+
+@pytest.mark.asyncio
+async def test_mute_bad_duration_does_not_mute():
+    store = FakeProactiveStore()
+    reg = build_command_registry(proactive_enabled=True)
+    reply = await reg.dispatch("mute", _ctx(args="wibble", proactive=store))
+    assert store.muted == []  # nothing set on a bad duration
+    assert "didn't catch" in reply.lower() or "try" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_unmute_clears_window():
+    store = FakeProactiveStore()
+    reg = build_command_registry(proactive_enabled=True)
+    await reg.dispatch("unmute", _ctx(proactive=store))
+    assert store.muted == [("EpeerD", None)]
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_proactive_store():
+    mem = FakeMemory()
+    store = FakeProactiveStore()
+    await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", proactive=store)
+    )
+    assert store.forgotten == ["EpeerD"]
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_proactive_section():
+    from datetime import datetime, timedelta, timezone
+
+    store = FakeProactiveStore(
+        muted_until=datetime.now(timezone.utc) + timedelta(hours=1)
+    )
+    reg = build_command_registry(proactive_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(proactive=store))
+    assert "proactive:" in reply.lower()
+    assert "muted until" in reply.lower()

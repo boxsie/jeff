@@ -20,6 +20,8 @@ from .memory import Memory
 from .mood import MoodStore
 from .ollama import Ollama
 from .pinned import Pinned, PinnedMemoryStore
+from .presence import Presence
+from .proactive import ProactiveLoop, ProactiveStore
 from .prompt import build_history, compose_system_prompt
 from .reflection import Reflector, ReflectionStore
 from .screen import screen_text
@@ -456,6 +458,37 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("appraisal disabled")
 
+            # Proactive autonomy loop (motivation slice 4) — default OFF. Built
+            # only when enabled so the disabled path makes no extra DB calls and
+            # stays byte-identical. Needs appraisal (the connection-pressure
+            # signal) AND curiosity (the candidates) on to ever reach out; with
+            # either off the loop is inert. Presence is shared with the event
+            # drain, which marks every inbound event so a reconnect after silence
+            # counts as "reachable now". The loop task is started after
+            # registration (it needs the handle); see below.
+            proactive_store: ProactiveStore | None = None
+            presence: Presence | None = None
+            if cfg.proactive_enabled:
+                proactive_store = await ProactiveStore.create(pool)
+                presence = Presence()
+                if not (cfg.appraisal_enabled and cfg.curiosity_enabled):
+                    log.warning(
+                        "proactive enabled but appraisal=%s curiosity=%s — the loop "
+                        "stays inert until both are on",
+                        cfg.appraisal_enabled,
+                        cfg.curiosity_enabled,
+                    )
+                log.info(
+                    "proactive enabled (check every %gs, connection<%.2f, min-gap %gs, "
+                    "presence ttl %gs)",
+                    cfg.proactive_interval_s,
+                    cfg.proactive_connection_threshold,
+                    cfg.proactive_min_gap_s,
+                    cfg.proactive_presence_ttl_s,
+                )
+            else:
+                log.info("proactive disabled")
+
             # Registry built AFTER the stores so the mood tools can be wired to
             # the mood store. Empty when tools are off → the no-tools turn path.
             registry = build_registry(
@@ -486,6 +519,7 @@ async def run(cfg: Config) -> None:
                     mood_enabled=cfg.mood_enabled,
                     remember_enabled=cfg.remember_enabled,
                     appraisal_enabled=cfg.appraisal_enabled,
+                    proactive_enabled=cfg.proactive_enabled,
                 )
                 if cfg.commands_enabled
                 else None
@@ -603,6 +637,31 @@ async def run(cfg: Config) -> None:
                     else:
                         log.info("signal front door disabled")
 
+                    # Proactive heartbeat (default off) — the consumer that turns
+                    # accrued state (curiosities, drive pressure) into unprompted
+                    # contact. Reaches out over the Ensemble handle to allowlisted
+                    # peers; presence is fed by the event drain below. (Signal-side
+                    # proactivity would need its own loop on the SignalHandle — a
+                    # future add; v1 reaches out over Ensemble only.)
+                    proactive_task: asyncio.Task | None = None
+                    if proactive_store is not None and presence is not None:
+                        proactive_loop = ProactiveLoop(
+                            handle,
+                            proactive_store,
+                            presence,
+                            memory,
+                            curiosity_store=curiosity_store,
+                            reflection_store=reflection_store,
+                            mood_store=mood_store,
+                            drive_store=drive_store,
+                            chat_provider=chat_provider,
+                            cfg=cfg,
+                            allowlist=cfg.allowlist,
+                        )
+                        proactive_task = asyncio.create_task(
+                            proactive_loop.run(), name="jeff-proactive"
+                        )
+
                     events_task = asyncio.create_task(
                         _drain_events(
                             handle,
@@ -617,6 +676,8 @@ async def run(cfg: Config) -> None:
                             mood_store,
                             pinned_store,
                             drive_store,
+                            proactive_store,
+                            presence,
                         ),
                         name="jeff-events",
                     )
@@ -624,6 +685,8 @@ async def run(cfg: Config) -> None:
                     wait_set = {events_task, stop_task}
                     if signal_task is not None:
                         wait_set.add(signal_task)
+                    if proactive_task is not None:
+                        wait_set.add(proactive_task)
                     done, pending = await asyncio.wait(
                         wait_set,
                         return_when=asyncio.FIRST_COMPLETED,
@@ -662,6 +725,7 @@ async def _handle_command(
     mood_store: "MoodStore | None" = None,
     pinned_store: "PinnedMemoryStore | None" = None,
     drive_store: "DriveState | None" = None,
+    proactive_store: "ProactiveStore | None" = None,
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -687,6 +751,7 @@ async def _handle_command(
         mood=mood_store,
         pinned=pinned_store,
         drives=drive_store,
+        proactive=proactive_store,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -708,9 +773,18 @@ async def _drain_events(
     mood_store: "MoodStore | None" = None,
     pinned_store: "PinnedMemoryStore | None" = None,
     drive_store: "DriveState | None" = None,
+    proactive_store: "ProactiveStore | None" = None,
+    presence: "Presence | None" = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
+        # Any inbound event means the peer is reachable right now — mark presence
+        # before the type dispatch so the proactive loop's "don't shout into the
+        # void" gate sees connects/commands/chats alike (a reconnect after silence
+        # is exactly when a reach-out should be allowed to fire).
+        src = getattr(event, "from_addr", None)
+        if presence is not None and isinstance(src, str) and src:
+            presence.mark(src)
         if isinstance(event, ensemble.CommandInvocation):
             # The daemon already gates invocations by the service ACL; re-check
             # the allowlist as defence-in-depth, mirroring the chat path.
@@ -735,6 +809,7 @@ async def _drain_events(
                 mood_store,
                 pinned_store,
                 drive_store,
+                proactive_store,
             )
             continue
         if not isinstance(event, ensemble.ChatMessage):

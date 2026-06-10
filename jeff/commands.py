@@ -48,6 +48,7 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     from .memory import Memory, Message
     from .mood import MoodStore
     from .pinned import PinnedMemoryStore
+    from .proactive import ProactiveStore
     from .reflection import ReflectionStore
 
 
@@ -92,6 +93,7 @@ class CommandContext:
     mood: "MoodStore | None" = None
     pinned: "PinnedMemoryStore | None" = None
     drives: "DriveState | None" = None
+    proactive: "ProactiveStore | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -218,6 +220,10 @@ async def _cmd_forget(ctx: CommandContext) -> str:
     # conversations); wipe them so they reset to baseline on a clean slate.
     if ctx.drives is not None:
         await ctx.drives.forget(ctx.peer)
+    # Proactive bookkeeping (last reach-out, mute, dedup key) is per-relationship
+    # too — wipe it so a clean slate starts the reach-out cadence fresh.
+    if ctx.proactive is not None:
+        await ctx.proactive.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -453,6 +459,56 @@ async def _cmd_remember(ctx: CommandContext) -> str:
     return "Pinned — I'll keep that in mind."
 
 
+_MUTE_DEFAULT_HOURS = 8
+
+
+def _parse_duration(raw: str):
+    """Parse a compact `<n><unit>` duration (s/m/h/d) into a timedelta, or None
+    if it doesn't parse. Used by `/mute`."""
+    import re
+    from datetime import timedelta
+
+    m = re.fullmatch(r"\s*(\d+)\s*([smhd])\s*", raw.lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    if n <= 0:
+        return None
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return timedelta(seconds=n * mult)
+
+
+async def _cmd_mute(ctx: CommandContext) -> str:
+    """Silence proactive (unprompted) reach-outs for a while. Bare `/mute` uses a
+    default window; `/mute 2h` / `/mute 30m` / `/mute 1d` set an explicit one.
+    Reactive replies are unaffected — Jeff still answers when you message."""
+    if ctx.proactive is None:
+        return "Proactive messaging isn't switched on, so there's nothing to mute."
+    from datetime import datetime, timedelta, timezone
+
+    arg = ctx.args.strip()
+    dur = _parse_duration(arg) if arg else timedelta(hours=_MUTE_DEFAULT_HOURS)
+    if dur is None:
+        return (
+            "I didn't catch that duration — try `/mute 2h`, `/mute 30m`, `/mute 1d`, "
+            "or just `/mute` for a few hours."
+        )
+    until = datetime.now(timezone.utc) + dur
+    await ctx.proactive.set_mute(ctx.peer, until)
+    return (
+        f"Muted — I won't message you on my own until about "
+        f"{until.isoformat(timespec='minutes')}. `/unmute` to lift it early."
+    )
+
+
+async def _cmd_unmute(ctx: CommandContext) -> str:
+    """Lift a `/mute` so Jeff can reach out unprompted again."""
+    if ctx.proactive is None:
+        return "Proactive messaging isn't switched on."
+    await ctx.proactive.set_mute(ctx.peer, None)
+    return "Unmuted — I might reach out when something's genuinely on my mind."
+
+
 async def _cmd_mind(ctx: CommandContext) -> str:
     """Show what's on Jeff's mind: open questions it wants to ask (curiosity), the
     facts + opinions it has formed (reflection), its current mood, and what it has
@@ -466,10 +522,12 @@ async def _cmd_mind(ctx: CommandContext) -> str:
         and ctx.mood is None
         and ctx.pinned is None
         and ctx.drives is None
+        and ctx.proactive is None
     ):
         return (
-            "None of curiosity, reflection, moods, pinned memory, or drives is "
-            "switched on right now, so there's nothing on my mind to show."
+            "None of curiosity, reflection, moods, pinned memory, drives, or "
+            "proactive messaging is switched on right now, so there's nothing on "
+            "my mind to show."
         )
 
     sections: list[str] = []
@@ -510,6 +568,27 @@ async def _cmd_mind(ctx: CommandContext) -> str:
             f"({_drive_band(levels[d.key], d.baseline)})"
             for d in DRIVES
         )
+        sections.append("\n".join(lines))
+
+    if ctx.proactive is not None:
+        from datetime import datetime, timezone
+
+        st = await ctx.proactive.get_state(ctx.peer)
+        now = datetime.now(timezone.utc)
+        lines = ["proactive:"]
+        if st.muted_until is not None and st.muted_until > now:
+            lines.append(
+                f"  • muted until {st.muted_until.isoformat(timespec='minutes')}"
+            )
+        else:
+            lines.append("  • not muted")
+        if st.last_send_at is not None:
+            lines.append(
+                f"  • last reached out: "
+                f"{st.last_send_at.isoformat(timespec='minutes')}"
+            )
+        else:
+            lines.append("  • haven't reached out on my own yet")
         sections.append("\n".join(lines))
 
     if ctx.curiosity is not None:
@@ -553,14 +632,16 @@ def build_command_registry(
     mood_enabled: bool = False,
     remember_enabled: bool = False,
     appraisal_enabled: bool = False,
+    proactive_enabled: bool = False,
 ) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
 
     `/mind` is declared when any of curiosity / reflection / mood / remember /
-    appraisal is on; `/mood` only when the mood drive is on; `/remember` only when
-    the remember drive is on — keeping the feature-off path's declared command set
-    unchanged."""
+    appraisal / proactive is on; `/mood` only when the mood drive is on;
+    `/remember` only when the remember drive is on; `/mute`+`/unmute` only when
+    proactive messaging is on — keeping the feature-off path's declared command
+    set unchanged."""
     cmds = [
         Command(
             "clear",
@@ -587,6 +668,7 @@ def build_command_registry(
         or mood_enabled
         or remember_enabled
         or appraisal_enabled
+        or proactive_enabled
     ):
         cmds.append(
             Command("mind", "show what's on my mind right now", _cmd_mind)
@@ -603,5 +685,17 @@ def build_command_registry(
                 _cmd_remember,
                 usage="<something to remember>",
             )
+        )
+    if proactive_enabled:
+        cmds.append(
+            Command(
+                "mute",
+                "stop me reaching out on my own for a while",
+                _cmd_mute,
+                usage="[2h|30m|1d]",
+            )
+        )
+        cmds.append(
+            Command("unmute", "let me reach out unprompted again", _cmd_unmute)
         )
     return CommandRegistry(cmds)

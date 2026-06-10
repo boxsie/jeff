@@ -21,6 +21,7 @@ from .memory import Memory
 from .mood import MoodStore
 from .ollama import Ollama
 from .pinned import PinnedMemoryStore
+from .proactive import ProactiveStore
 from .reflection import ReflectionStore
 
 
@@ -124,10 +125,13 @@ async def _reset_memory(cfg: Config) -> None:
             # dimension change, but "clean slate" means drop and recreate it.
             drives = DriveState(pool, half_life_hours=cfg.drive_decay_half_life_hours)
             await drives.reset()
+            # Proactive bookkeeping is a plain table too — recreate on clean slate.
+            proactive = ProactiveStore(pool)
+            await proactive.reset()
             print(
                 f"memory reset — messages + curiosities + derived_memory + mood + "
-                f"pinned + drive_state schema recreated at dim={cfg.embed_dim} "
-                f"(model={cfg.embed_model})"
+                f"pinned + drive_state + proactive_state schema recreated at "
+                f"dim={cfg.embed_dim} (model={cfg.embed_model})"
             )
     finally:
         await pool.close()

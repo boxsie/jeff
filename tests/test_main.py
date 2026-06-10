@@ -533,6 +533,39 @@ async def test_command_invocation_handler_raise_replies_safely():
 
 
 @pytest.mark.asyncio
+async def test_drain_events_marks_presence_on_inbound_events():
+    """Every inbound event marks the peer present, so the proactive loop's
+    'don't shout into the void' gate sees chats AND commands as reachability."""
+    from datetime import datetime, timezone
+
+    from jeff.commands import build_command_registry
+    from jeff.presence import Presence
+
+    presence = Presence()
+    handle = _FakeEventsHandle(
+        [
+            _invocation("clear"),  # a command counts as reachability too
+            ensemble.ChatMessage(type="chat", from_addr="EpeerD", text="hi", ts=0),
+        ]
+    )
+    dispatcher = TurnDispatcher(
+        lambda peer, text: _noop(), DispatchPolicy(max_inflight=10, peer_rate_burst=10)
+    )
+    await _drain_events(
+        handle,
+        dispatcher,
+        _commands_cfg(),
+        FakeCommandMemory(),
+        build_command_registry(),
+        presence=presence,
+    )
+    await dispatcher.drain()
+    assert presence.is_present(
+        "EpeerD", now=datetime.now(timezone.utc), ttl_s=60
+    )
+
+
+@pytest.mark.asyncio
 async def test_drain_events_drops_oversize_and_sends_polite_reply():
     """Oversize messages get a rejection reply and never hit the dispatcher."""
     cfg = Config.from_env(
