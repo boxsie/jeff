@@ -41,7 +41,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
 
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
@@ -73,7 +73,18 @@ _DDL = sql.SQL(
     "peer TEXT PRIMARY KEY, "
     "last_send_at TIMESTAMPTZ, "
     "last_nudge_key TEXT, "
-    "muted_until TIMESTAMPTZ)"
+    "muted_until TIMESTAMPTZ, "
+    "last_asked_curiosity_ids BIGINT[])"
+)
+
+# Idempotent column add for tables created before last_asked_curiosity_ids
+# existed: CREATE TABLE IF NOT EXISTS is a no-op on an existing table, so a fresh
+# column would never appear on an already-deployed proactive_state (the exact
+# schema-drift landmine filed as dbafb5ea). ADD COLUMN IF NOT EXISTS is a safe,
+# self-applying migration — no reset-memory needed to pick up this column.
+_DDL_MIGRATE_ASKED = sql.SQL(
+    "ALTER TABLE proactive_state "
+    "ADD COLUMN IF NOT EXISTS last_asked_curiosity_ids BIGINT[]"
 )
 
 
@@ -100,6 +111,7 @@ class ProactiveStore:
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL)
+                await cur.execute(_DDL_MIGRATE_ASKED)
             await conn.commit()
 
     async def get_state(self, peer: str) -> ProactiveState:
@@ -115,19 +127,58 @@ class ProactiveStore:
             return ProactiveState(peer, None, None, None)
         return ProactiveState(peer, row[0], row[1], row[2])
 
-    async def record_send(self, peer: str, nudge_key: str, now: datetime) -> None:
-        """Stamp a reach-out: update the floor timestamp + dedup key."""
+    async def record_send(
+        self,
+        peer: str,
+        nudge_key: str,
+        now: datetime,
+        asked_curiosity_ids: Sequence[int] | None = None,
+    ) -> None:
+        """Stamp a reach-out: update the floor timestamp + dedup key, and record
+        which open curiosity id(s) fuelled this unprompted message so the next
+        inbound turn can close the loop on them. An empty/absent list stores NULL.
+        """
+        asked = [int(i) for i in asked_curiosity_ids] if asked_curiosity_ids else None
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO proactive_state (peer, last_send_at, last_nudge_key) "
-                    "VALUES (%s, %s, %s) "
+                    "INSERT INTO proactive_state "
+                    "  (peer, last_send_at, last_nudge_key, last_asked_curiosity_ids) "
+                    "VALUES (%s, %s, %s, %s) "
                     "ON CONFLICT (peer) DO UPDATE SET "
                     "  last_send_at = EXCLUDED.last_send_at, "
-                    "  last_nudge_key = EXCLUDED.last_nudge_key",
-                    (peer, now, nudge_key),
+                    "  last_nudge_key = EXCLUDED.last_nudge_key, "
+                    "  last_asked_curiosity_ids = EXCLUDED.last_asked_curiosity_ids",
+                    (peer, now, nudge_key, asked),
                 )
             await conn.commit()
+
+    async def take_asked_curiosity_ids(self, peer: str) -> list[int]:
+        """Read AND clear the curiosity id(s) a proactive reach-out asked about.
+
+        Consume-once: the asked ids are a hint that *this peer's next inbound
+        message is likely the reply*, so they're cleared as they're handed out.
+        Atomic via a writable CTE — the `cur` SELECT sees the pre-UPDATE snapshot,
+        so the old value is returned even as the same statement nulls it. Returns
+        [] when there's nothing pending (the common case, every ordinary turn).
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "WITH cur AS ("
+                    "  SELECT last_asked_curiosity_ids AS ids "
+                    "  FROM proactive_state WHERE peer = %s"
+                    "), upd AS ("
+                    "  UPDATE proactive_state SET last_asked_curiosity_ids = NULL "
+                    "  WHERE peer = %s AND last_asked_curiosity_ids IS NOT NULL"
+                    ") "
+                    "SELECT ids FROM cur",
+                    (peer, peer),
+                )
+                row = await cur.fetchone()
+            await conn.commit()
+        ids = row[0] if row and row[0] else []
+        return [int(i) for i in ids]
 
     async def set_mute(self, peer: str, until: datetime | None) -> None:
         """Set (or clear, with ``until=None``) the operator's mute window."""
@@ -316,11 +367,15 @@ class ProactiveLoop:
                     "proactive tick peer=%s skip=no-pressure conn=%.2f", peer, conn
                 )
                 return
-            # Candidates: concrete things worth raising (open curiosities).
+            # Candidates: concrete things worth raising (open curiosities). Keep
+            # the curiosity objects (not just text) so the asked id(s) can be
+            # recorded on send — that's what lets the next inbound turn close the
+            # loop and mark the question answered (ticket 342c7071).
             open_cur = await self._curiosity.open_curiosities(
                 peer, limit=self._cfg.curiosity_max_open
             )
-            candidates = [c.text for c in open_cur][:_MAX_CANDIDATES]
+            chosen = open_cur[:_MAX_CANDIDATES]
+            candidates = [c.text for c in chosen]
             if not candidates:
                 log.info(
                     "proactive tick peer=%s skip=no-candidates conn=%.2f", peer, conn
@@ -348,8 +403,14 @@ class ProactiveLoop:
                 return
             await self._handle.send_message(peer, message)
             await self._memory.remember(peer, "assistant", message)
-            await self._store.record_send(peer, nudge_key, now)
-            log.info("proactive reach-out sent peer=%s nudge=%s", peer, nudge_key)
+            asked_ids = [c.id for c in chosen]
+            await self._store.record_send(peer, nudge_key, now, asked_ids)
+            log.info(
+                "proactive reach-out sent peer=%s nudge=%s asked=%d",
+                peer,
+                nudge_key,
+                len(asked_ids),
+            )
         except Exception as e:
             # Type-only (never the message — may carry model/peer-shaped text).
             log.error("proactive reach-out failed peer=%s exc=%s", peer, type(e).__name__)

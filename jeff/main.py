@@ -506,6 +506,14 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("proactive disabled")
 
+            # Close the proactive-ask → resolution loop: when both the proactive
+            # store and the curiosity driver exist, let detection passes consume
+            # the curiosity id(s) a reach-out asked about so an answered question
+            # gets marked satisfied instead of lingering in /mind (ticket
+            # 342c7071). No-op when either is off.
+            if curiosity_driver is not None and proactive_store is not None:
+                curiosity_driver.attach_proactive_store(proactive_store)
+
             # Impulses (motivation slice) — self-authored short-term directional
             # drives. Default OFF: built only when enabled so the disabled path
             # makes no extra DB calls and stays byte-identical. Plain Postgres (no

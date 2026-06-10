@@ -133,3 +133,64 @@ async def test_reset_wipes_and_recreates(pool):
     # Usable after reset.
     await store.record_send("EpeerD", "k2", _NOW)
     assert (await store.get_state("EpeerD")).last_nudge_key == "k2"
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_record_send_persists_asked_curiosity_ids(pool):
+    store = await ProactiveStore.create(pool)
+    await store.record_send("EpeerD", "k", _NOW, [10, 11, 12])
+    # take returns them, then clears (consume-once).
+    assert await store.take_asked_curiosity_ids("EpeerD") == [10, 11, 12]
+    assert await store.take_asked_curiosity_ids("EpeerD") == []
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_take_asked_curiosity_ids_empty_and_none(pool):
+    store = await ProactiveStore.create(pool)
+    # Never sent → no row → empty.
+    assert await store.take_asked_curiosity_ids("EpeerD") == []
+    # A send with no asked ids stores NULL, not an empty array we'd re-hand-out.
+    await store.record_send("EpeerD", "k", _NOW)
+    assert await store.take_asked_curiosity_ids("EpeerD") == []
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_record_send_overwrites_prior_asked_ids(pool):
+    store = await ProactiveStore.create(pool)
+    await store.record_send("EpeerD", "k1", _NOW, [1, 2])
+    # A fresh reach-out replaces the pending set (not appends).
+    await store.record_send("EpeerD", "k2", _NOW + timedelta(hours=2), [9])
+    assert await store.take_asked_curiosity_ids("EpeerD") == [9]
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_forget_clears_asked_ids(pool):
+    store = await ProactiveStore.create(pool)
+    await store.record_send("EpeerD", "k", _NOW, [5])
+    await store.forget("EpeerD")
+    assert await store.take_asked_curiosity_ids("EpeerD") == []
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_create_migrates_preexisting_table_without_asked_column(pool):
+    """The deployed proactive_state predates last_asked_curiosity_ids; create()
+    must ADD COLUMN IF NOT EXISTS so the column appears without a reset-memory."""
+    # Hand-build the OLD table shape (no last_asked_curiosity_ids column).
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("DROP TABLE IF EXISTS proactive_state")
+            await cur.execute(
+                "CREATE TABLE proactive_state ("
+                "peer TEXT PRIMARY KEY, last_send_at TIMESTAMPTZ, "
+                "last_nudge_key TEXT, muted_until TIMESTAMPTZ)"
+            )
+        await conn.commit()
+    # create() runs the migration; the column now exists and round-trips.
+    store = await ProactiveStore.create(pool)
+    await store.record_send("EpeerD", "k", _NOW, [7, 8])
+    assert await store.take_asked_curiosity_ids("EpeerD") == [7, 8]

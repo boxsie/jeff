@@ -50,6 +50,7 @@ from .screen import strip_chat_template_tokens
 if TYPE_CHECKING:
     from .config import Config
     from .llm import ChatProvider
+    from .proactive import ProactiveStore
 
 
 log = logging.getLogger("jeff.curiosity")
@@ -356,8 +357,12 @@ _INSTRUCTION = (
     "later.\n\n"
     "You are given the assistant's current OPEN questions (numbered) and the "
     "latest exchange. Return two things:\n"
-    '1. "answered": the numbers of any open questions that THIS exchange '
-    "actually answered (they just told you the answer). Empty if none.\n"
+    '1. "answered": the numbers of any open questions this exchange actually '
+    "answered. Include a question even if the assistant didn't ask it in THIS "
+    "exchange — the person may be replying to something the assistant raised "
+    "earlier or reached out about unprompted, so an open question counts as "
+    "answered whenever their message genuinely supplies the answer. Empty if "
+    "none.\n"
     '2. "curious": 0 to a few short, specific questions you genuinely became '
     "curious about from this exchange — things you cannot already know and would "
     "want to ask THEM about their life, world, or opinions. Grounded in what was "
@@ -395,6 +400,18 @@ class CuriosityDriver:
         # In-memory cadence counter per peer (throttling only — resetting on
         # restart is harmless, so it deliberately isn't persisted).
         self._turns_since: dict[str, int] = {}
+        # Optional back-reference to the proactive store, attached by main when
+        # the proactive loop is enabled. When present, a detection pass consumes
+        # the curiosity id(s) a recent unprompted reach-out asked about and hints
+        # the model that the peer's message likely answers them (ticket 342c7071).
+        # Left None (and untouched) when proactive is off — byte-identical path.
+        self._proactive: "ProactiveStore | None" = None
+
+    def attach_proactive_store(self, store: "ProactiveStore") -> None:
+        """Wire in the proactive store after construction (it's built later than
+        the driver in main.run). Lets detection passes close the proactive-ask
+        loop; a no-op for resolution if never called."""
+        self._proactive = store
 
     async def maybe_detect(
         self, peer: str, user_text: str, assistant_text: str
@@ -450,11 +467,35 @@ class CuriosityDriver:
 
     async def _detect(self, peer: str, user_text: str, assistant_text: str) -> None:
         existing = await self._store.open_curiosities(peer, limit=_EXISTING_LIMIT)
+
+        # Close the proactive-ask loop: if a recent unprompted reach-out asked
+        # about specific curiosities, this peer's message is likely the reply.
+        # Consume those ids (read-and-clear) and map any still-open ones to their
+        # index in `existing` so the model can be told to check them carefully.
+        # Cleared as consumed: the hint is "their NEXT message answers this", a
+        # one-shot — if they didn't answer, generic detection still applies later.
+        asked_indices: list[int] = []
+        if self._proactive is not None:
+            try:
+                asked_ids = await self._proactive.take_asked_curiosity_ids(peer)
+            except Exception as e:  # never taint the pass on a bookkeeping read
+                log.error(
+                    "proactive asked-ids read failed peer=%s exc=%s",
+                    peer,
+                    type(e).__name__,
+                )
+                asked_ids = []
+            if asked_ids:
+                id_to_idx = {c.id: i for i, c in enumerate(existing)}
+                asked_indices = [id_to_idx[i] for i in asked_ids if i in id_to_idx]
+
         messages = [
             {"role": "system", "content": _INSTRUCTION},
             {
                 "role": "user",
-                "content": _build_user_block(existing, user_text, assistant_text),
+                "content": _build_user_block(
+                    existing, user_text, assistant_text, asked_indices=asked_indices
+                ),
             },
         ]
         raw = await self._provider.chat(messages, model=self._cfg.chat_model)
@@ -485,7 +526,11 @@ class CuriosityDriver:
 
 
 def _build_user_block(
-    existing: list[Curiosity], user_text: str, assistant_text: str
+    existing: list[Curiosity],
+    user_text: str,
+    assistant_text: str,
+    *,
+    asked_indices: Sequence[int] | None = None,
 ) -> str:
     user_text = strip_chat_template_tokens(user_text)[:_MAX_EXCHANGE_CHARS]
     assistant_text = strip_chat_template_tokens(assistant_text)[:_MAX_EXCHANGE_CHARS]
@@ -500,6 +545,14 @@ def _build_user_block(
         f"[them] <peer_message>{user_text}</peer_message>\n"
         f"[you] {assistant_text}"
     )
+    if asked_indices:
+        nums = ", ".join(f"[{i}]" for i in asked_indices)
+        parts.append(
+            f"Note: you recently reached out to them UNPROMPTED about question(s) "
+            f"{nums}. Their message above is most likely a reply to that — check "
+            f"carefully whether it answers any of them and, if so, include those "
+            f"numbers in \"answered\"."
+        )
     return "\n\n".join(parts)
 
 

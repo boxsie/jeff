@@ -45,22 +45,26 @@ class FakeDrives:
 
 class FakeCuriosity:
     def __init__(self, texts: list[str]):
+        # ids are 1-based so the reach-out has a concrete id to record per text.
         self._texts = texts
 
     async def open_curiosities(self, peer, limit):
-        return [SimpleNamespace(text=t) for t in self._texts[:limit]]
+        return [
+            SimpleNamespace(id=i + 1, text=t)
+            for i, t in enumerate(self._texts[:limit])
+        ]
 
 
 class FakeStore:
     def __init__(self, state: ProactiveState | None = None):
         self._state = state
-        self.sends: list[tuple[str, str, datetime]] = []
+        self.sends: list[tuple[str, str, datetime, list[int]]] = []
 
     async def get_state(self, peer):
         return self._state or ProactiveState(peer, None, None, None)
 
-    async def record_send(self, peer, nudge_key, now):
-        self.sends.append((peer, nudge_key, now))
+    async def record_send(self, peer, nudge_key, now, asked_curiosity_ids=None):
+        self.sends.append((peer, nudge_key, now, list(asked_curiosity_ids or [])))
 
 
 class FakePresence:
@@ -243,6 +247,21 @@ async def test_pressure_and_candidate_consults_gatekeeper_and_sends():
     assert handle.sent == [("EpeerD", "been wondering how X went")]
     assert mem.remembered == [("EpeerD", "assistant", "been wondering how X went")]
     assert store.sends and store.sends[0][0] == "EpeerD"
+
+
+@pytest.mark.asyncio
+async def test_reach_out_records_asked_curiosity_ids():
+    # The whole point of ticket 342c7071: a reach-out must persist WHICH open
+    # curiosities fuelled it, so the next inbound turn can mark them answered.
+    prov = FakeProvider('{"send": true, "message": "how did the bike thing go?"}')
+    store = FakeStore()
+    loop = _loop(
+        provider=prov, store=store, curiosity=FakeCuriosity(["q1", "q2", "q3"])
+    )
+    await loop._maybe_reach_out("EpeerD", _NOW)
+    assert len(store.sends) == 1
+    _, _, _, asked = store.sends[0]
+    assert asked == [1, 2, 3]  # the FakeCuriosity ids for the surfaced candidates
 
 
 @pytest.mark.asyncio

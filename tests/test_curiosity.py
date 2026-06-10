@@ -109,6 +109,18 @@ def test_build_user_block_handles_no_existing():
     assert "no open questions yet" in block.lower()
 
 
+def test_build_user_block_adds_proactive_hint_for_asked_indices():
+    existing = [_cur(10, "first?"), _cur(11, "second?")]
+    block = _build_user_block(existing, "the answer", "ok", asked_indices=[1])
+    assert "UNPROMPTED" in block
+    assert "[1]" in block  # points the model at the asked question's index
+
+
+def test_build_user_block_no_hint_when_no_asked_indices():
+    block = _build_user_block([_cur(1, "q?")], "u", "a", asked_indices=[])
+    assert "UNPROMPTED" not in block
+
+
 # --- driver tests (no DB, fake store + fake provider) ----------------------
 
 
@@ -141,6 +153,20 @@ class FakeProvider:
     async def chat(self, messages, *, model):
         self.calls.append(list(messages))
         return self.reply
+
+
+class FakeProactive:
+    """Stand-in for ProactiveStore's asked-id hand-off: returns the pending ids
+    once, then empty (consume-once), and counts takes."""
+
+    def __init__(self, ids: list[int] | None = None):
+        self._ids = list(ids or [])
+        self.takes = 0
+
+    async def take_asked_curiosity_ids(self, peer):
+        self.takes += 1
+        ids, self._ids = self._ids, []
+        return ids
 
 
 def _cfg(**extra) -> Config:
@@ -178,6 +204,55 @@ async def test_driver_detect_no_signal_writes_nothing():
 
     assert store.satisfied == []
     assert store.added == []
+
+
+@pytest.mark.asyncio
+async def test_detect_consumes_proactive_asked_ids_and_hints_model():
+    # The fix path for 342c7071: a proactive ask recorded curiosity id 11; the
+    # peer's reply answers it; detection consumes the hint, points the model at
+    # the right index, and the answered question flips satisfied.
+    existing = [_cur(10, "what work do they do?"), _cur(11, "how did the race go?")]
+    store = FakeStore(existing)
+    provider = FakeProvider('{"answered": [1], "curious": []}')
+    driver = CuriosityDriver(store, provider, _cfg())
+    proactive = FakeProactive([11])
+    driver.attach_proactive_store(proactive)
+
+    await driver._detect("EpeerD", "it went great, PB!", "amazing, well done")
+
+    assert store.satisfied == [[11]]  # id 11 (index 1) marked answered
+    block = provider.calls[0][1]["content"]
+    assert "UNPROMPTED" in block and "[1]" in block  # hint reached the model
+    assert proactive.takes == 1  # consumed exactly once
+
+
+@pytest.mark.asyncio
+async def test_detect_drops_stale_asked_ids_not_in_open_set():
+    # An asked id that's no longer open (already satisfied / forgotten) maps to no
+    # index — it's silently dropped, no hint, no crash.
+    existing = [_cur(10, "still open?")]
+    store = FakeStore(existing)
+    provider = FakeProvider('{"answered": [], "curious": []}')
+    driver = CuriosityDriver(store, provider, _cfg())
+    driver.attach_proactive_store(FakeProactive([999]))  # not in existing
+
+    await driver._detect("EpeerD", "hi", "hey")
+
+    block = provider.calls[0][1]["content"]
+    assert "UNPROMPTED" not in block
+
+
+@pytest.mark.asyncio
+async def test_detect_without_proactive_store_is_unchanged():
+    # No proactive store attached → no take, no hint (byte-identical to before).
+    store = FakeStore([_cur(10, "q?")])
+    provider = FakeProvider('{"answered": [], "curious": []}')
+    driver = CuriosityDriver(store, provider, _cfg())
+
+    await driver._detect("EpeerD", "hi", "hey")
+
+    block = provider.calls[0][1]["content"]
+    assert "UNPROMPTED" not in block
 
 
 @pytest.mark.asyncio
