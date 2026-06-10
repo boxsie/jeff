@@ -67,13 +67,25 @@ class FakeCuriosity:
         return [SimpleNamespace(id=i, text=f"q{i}") for i in self._ids[:limit]]
 
 
-def _tool(*, handle=None, presence=None, store=None, memory=None, curiosity=None):
+class FakeDrives:
+    def __init__(self):
+        self.spends: list[tuple] = []
+
+    async def spend(self, peer, action, costs):
+        self.spends.append((peer, action, dict(costs)))
+        return {}
+
+
+def _tool(
+    *, handle=None, presence=None, store=None, memory=None, curiosity=None, drives=None
+):
     return ReachOutTool(
         handle or FakeHandle(),
         store or FakeStore(),
         presence or FakePresence(present=True),
         memory or FakeMemory(),
         curiosity_store=curiosity,
+        drive_store=drives,
         min_gap_s=1800.0,
         presence_ttl_s=3600.0,
         max_chars=1500,
@@ -108,6 +120,33 @@ async def test_no_curiosity_store_records_empty_asked():
     tool = _tool(store=store, curiosity=None)
     await tool.run(peer="EpeerD", message="hi")
     assert store.sends[0][3] == []
+
+
+@pytest.mark.asyncio
+async def test_spends_connection_on_successful_send():
+    from jeff.economy import REACH_OUT_COST
+
+    drives = FakeDrives()
+    tool = _tool(drives=drives)
+    await tool.run(peer="EpeerD", message="hey")
+    # Debited connection currency, tagged as the reach_out action, only on a send.
+    assert drives.spends == [("EpeerD", "reach_out", REACH_OUT_COST)]
+
+
+@pytest.mark.asyncio
+async def test_no_charge_when_gate_refuses():
+    drives = FakeDrives()
+    tool = _tool(presence=FakePresence(present=False), drives=drives)
+    await tool.run(peer="EpeerD", message="hi")
+    assert drives.spends == []  # refused → no send → no charge
+
+
+@pytest.mark.asyncio
+async def test_no_charge_when_send_fails():
+    drives = FakeDrives()
+    tool = _tool(handle=FakeHandle(raise_on_send=True), drives=drives)
+    await tool.run(peer="EpeerD", message="hi")
+    assert drives.spends == []  # send threw → no charge
 
 
 # --- gate refusals (no send, no bookkeeping) --------------------------------

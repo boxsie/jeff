@@ -218,7 +218,9 @@ async def handle_turn(
         # still recorded even if the chat/tool call fails (matches prior behaviour).
         await memory.remember(peer, "user", text)
         if registry is not None and cfg.tools_enabled and len(registry):
-            reply = await run_tool_loop(chat_provider, registry, history, cfg, peer)
+            reply = await run_tool_loop(
+                chat_provider, registry, history, cfg, peer, drive_store=drive_store
+            )
         else:
             reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
@@ -668,6 +670,7 @@ async def run(cfg: Config) -> None:
                             presence=presence,
                             proactive_store=proactive_store,
                             curiosity_store=curiosity_store,
+                            drive_store=drive_store,
                         )
                         if len(self_turn_registry) == 0:
                             log.warning(

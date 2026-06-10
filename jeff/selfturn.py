@@ -187,7 +187,12 @@ class SelfTurnLoop:
             # The execute-and-loop runs Jeff's chosen inward verbs (or none). The
             # result is Jeff's own narration — not sent anywhere, just logged.
             result = await run_tool_loop(
-                self._provider, self._registry, messages, self._cfg, peer
+                self._provider,
+                self._registry,
+                messages,
+                self._cfg,
+                peer,
+                drive_store=self._drives,
             )
             # Advance the min-gap whether or not Jeff acted: the turn was spent.
             self._last[peer] = now

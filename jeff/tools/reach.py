@@ -25,6 +25,7 @@ import logging
 from datetime import datetime, timezone
 from typing import ClassVar
 
+from ..economy import REACH_OUT_COST
 from .base import Tool
 
 
@@ -73,6 +74,7 @@ class ReachOutTool(Tool):
         memory,
         *,
         curiosity_store=None,
+        drive_store=None,
         min_gap_s: float,
         presence_ttl_s: float,
         max_chars: int,
@@ -82,6 +84,7 @@ class ReachOutTool(Tool):
         self._presence = presence
         self._memory = memory
         self._curiosity = curiosity_store
+        self._drives = drive_store
         self._min_gap_s = min_gap_s
         self._presence_ttl_s = presence_ttl_s
         self._max_chars = max_chars
@@ -129,6 +132,11 @@ class ReachOutTool(Tool):
             asked = await self._asked_curiosity_ids(peer)
             nudge_key = hashlib.sha1(message.encode("utf-8")).hexdigest()[:16]
             await self._store.record_send(peer, nudge_key, now, asked)
+            # Spend the connection currency the reach-out used — only now that the
+            # send landed (no send → no charge). Floors at 0; leaves the EMA
+            # reference, so spending it reads as a fresh connection deficit.
+            if self._drives is not None:
+                await self._drives.spend(peer, self.name, REACH_OUT_COST)
             log.info("reach_out sent peer=%s asked=%d", peer, len(asked))
         except Exception as e:
             log.error("reach_out bookkeeping failed peer=%s exc=%s", peer, type(e).__name__)

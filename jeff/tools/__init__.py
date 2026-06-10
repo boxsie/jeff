@@ -158,6 +158,7 @@ def build_self_turn_registry(
     presence=None,
     proactive_store=None,
     curiosity_store=None,
+    drive_store=None,
 ) -> ToolRegistry:
     """The registry the idle self-turn wields: Jeff's INWARD verbs (mood /
     impulse / remember) + the read-only memory-scan tools (recall / summarize),
@@ -200,6 +201,7 @@ def build_self_turn_registry(
                 presence,
                 memory,
                 curiosity_store=curiosity_store,
+                drive_store=drive_store,
                 min_gap_s=cfg.proactive_min_gap_s,
                 presence_ttl_s=cfg.proactive_presence_ttl_s,
                 max_chars=REACH_OUT_MAX_CHARS,

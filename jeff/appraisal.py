@@ -176,6 +176,16 @@ class DriveReading(NamedTuple):
     reference: float
 
 
+class SpendRecord(NamedTuple):
+    """One row of the spend ledger: which action debited which drive, by how much,
+    and when. ``spent_at`` is a timezone-aware datetime from Postgres."""
+
+    action: str
+    drive: str
+    amount: float
+    spent_at: object
+
+
 def floor_at_zero(x: float) -> float:
     """Floor a level at 0. Drives are uncapped *above* (no ``1.0`` ceiling — that
     was the drivemaxxing attractor) but a balance can't go negative."""
@@ -248,6 +258,28 @@ _EXPECTED_COLUMNS = frozenset(
     {"id", "peer", "drive", "level", "ema", "updated_at"}
 )
 
+# The spend ledger (slice b1): an append-only log of what each action cost, so
+# the /mind economy view and the earn-back P&L (slice b2) can see expenditure,
+# not just the running balance. One row per (action, drive) debited.
+_DDL_SPEND_TABLE = sql.SQL(
+    "CREATE TABLE IF NOT EXISTS drive_spend ("
+    "id BIGSERIAL PRIMARY KEY, "
+    "peer TEXT NOT NULL, "
+    "action TEXT NOT NULL, "
+    "drive TEXT NOT NULL, "
+    "amount DOUBLE PRECISION NOT NULL, "
+    "spent_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+)
+
+_DDL_IDX_SPEND = sql.SQL(
+    "CREATE INDEX IF NOT EXISTS idx_drive_spend_peer_at "
+    "ON drive_spend(peer, spent_at DESC)"
+)
+
+_EXPECTED_SPEND_COLUMNS = frozenset(
+    {"id", "peer", "action", "drive", "amount", "spent_at"}
+)
+
 
 class DriveState:
     """Async store of a peer's drive levels (plain Postgres, lazy read-time decay).
@@ -283,7 +315,10 @@ class DriveState:
                 await cur.execute(_DDL_TABLE)
                 await cur.execute(_DDL_ADD_EMA)
                 await cur.execute(_DDL_IDX_PEER)
+                await cur.execute(_DDL_SPEND_TABLE)
+                await cur.execute(_DDL_IDX_SPEND)
                 await assert_columns(cur, "drive_state", _EXPECTED_COLUMNS)
+                await assert_columns(cur, "drive_spend", _EXPECTED_SPEND_COLUMNS)
             await conn.commit()
 
     async def state(self, peer: str) -> dict[str, DriveReading]:
@@ -387,21 +422,100 @@ class DriveState:
             await conn.commit()
         return applied
 
+    async def spend(
+        self, peer: str, action: str, costs: dict[str, float]
+    ) -> dict[str, float]:
+        """Debit drive currency for an ``action`` and log the expenditure.
+
+        Each ``(drive, amount)`` in ``costs`` leaks the level to now, subtracts the
+        amount, and **floors at 0** — a spend can never drive a balance negative
+        (the affordability/bankruptcy guard is a later slice; here we just floor).
+        Crucially the EMA **reference is left untouched**: spending lowers the
+        balance but not your recent *norm*, so a spend correctly reads as "low for
+        you" — the deficit that motivates the next move. Only positive amounts for
+        known drives are honoured. Every debited drive also appends a ``drive_spend``
+        row (the nominal cost, for the /mind view and the earn-back P&L). Returns
+        the new stored levels for the drives that were touched. Floored: a drive at
+        0 with no row stays at 0 (logged, no phantom row written)."""
+        wanted = {
+            k: float(v)
+            for k, v in costs.items()
+            if k in _BASELINES and float(v) > 0.0
+        }
+        if not wanted:
+            return {}
+        applied: dict[str, float] = {}
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for drive, amount in wanted.items():
+                    await cur.execute(
+                        "SELECT level, EXTRACT(EPOCH FROM (now() - updated_at)) "
+                        "FROM drive_state WHERE peer = %s AND drive = %s",
+                        (peer, drive),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        # Nothing banked — the balance is already 0; log the spend
+                        # intent but don't write a phantom level row.
+                        applied[drive] = 0.0
+                    else:
+                        current = decay_toward_baseline(
+                            float(row[0]),
+                            _BASELINES[drive],
+                            float(row[1] or 0.0),
+                            self._half_life_for(drive),
+                        )
+                        new_level = floor_at_zero(current - amount)
+                        # Update the level + clock only; ema stays as stored so the
+                        # reference doesn't drop with the spend.
+                        await cur.execute(
+                            "UPDATE drive_state SET level = %s, updated_at = now() "
+                            "WHERE peer = %s AND drive = %s",
+                            (new_level, peer, drive),
+                        )
+                        applied[drive] = new_level
+                    await cur.execute(
+                        "INSERT INTO drive_spend (peer, action, drive, amount) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (peer, action, drive, amount),
+                    )
+            await conn.commit()
+        return applied
+
+    async def recent_spends(self, peer: str, limit: int = 20) -> list[SpendRecord]:
+        """The most recent spend-log rows for one peer (newest first), for the
+        /mind economy view and the earn-back P&L. Bounded by ``limit``."""
+        out: list[SpendRecord] = []
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT action, drive, amount, spent_at FROM drive_spend "
+                    "WHERE peer = %s ORDER BY spent_at DESC, id DESC LIMIT %s",
+                    (peer, max(1, int(limit))),
+                )
+                rows = await cur.fetchall()
+        for action, drive, amount, spent_at in rows:
+            out.append(SpendRecord(action, drive, float(amount), spent_at))
+        return out
+
     async def forget(self, peer: str) -> int:
-        """Delete every drive row for one peer (so /forget wipes these too)."""
+        """Delete every drive row AND spend-log row for one peer (so /forget wipes
+        the whole economy). Returns the number of drive_state rows removed."""
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM drive_state WHERE peer = %s", (peer,))
                 deleted = cur.rowcount
+                await cur.execute("DELETE FROM drive_spend WHERE peer = %s", (peer,))
             await conn.commit()
         return int(deleted)
 
     async def reset(self) -> None:
-        """Destructive fresh start: drop the table and recreate it (called by
+        """Destructive fresh start: drop both tables and recreate them (called by
         ``reset-memory``; mirrors MoodStore.reset)."""
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DROP TABLE IF EXISTS drive_state")
+                await cur.execute("DROP TABLE IF EXISTS drive_spend")
             await conn.commit()
         await self._init_schema()
 

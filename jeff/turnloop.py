@@ -16,10 +16,15 @@ loop returns a graceful cap message rather than spinning forever.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from .config import Config
+from .economy import cost_for
 from .llm import ChatProvider, ChatResult
 from .tools.base import ToolRegistry
+
+if TYPE_CHECKING:
+    from .appraisal import DriveState
 
 
 log = logging.getLogger("jeff.turnloop")
@@ -60,6 +65,8 @@ async def run_tool_loop(
     history: list[dict],
     cfg: Config,
     peer: str,
+    *,
+    drive_store: "DriveState | None" = None,
 ) -> str:
     """Call the provider, execute any tool calls, repeat until a final answer.
 
@@ -71,6 +78,13 @@ async def run_tool_loop(
 
     `peer` is the current turn's address; it's passed to `dispatch` so
     peer-scoped tools (e.g. the mood tools) write to the right peer's state.
+
+    When `drive_store` is supplied (the drive economy is on), invoking a costed
+    verb **debits** its drive currency (`economy.COSTS`) — this is the single seam
+    where self-turn verbs and impulse/mood acts spend, in both the chat and
+    self-turn paths. `reach_out` is deliberately NOT in COSTS: it self-charges
+    inside the tool, conditional on the send succeeding. The debit is best-effort
+    and post-dispatch — a spend fault never breaks the turn (mirrors appraisal).
     """
     specs = registry.specs()
     messages = list(history)
@@ -85,5 +99,22 @@ async def run_tool_loop(
                 tc.name, tc.arguments, peer=peer, timeout=cfg.tool_timeout_s
             )
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+            await _charge(drive_store, peer, tc.name)
     log.warning("tool loop hit iteration cap (%d)", cfg.max_tool_iters)
     return TOOL_CAP_MESSAGE
+
+
+async def _charge(drive_store: "DriveState | None", peer: str, action: str) -> None:
+    """Best-effort debit of a costed verb's drive currency. Never raises — a spend
+    fault must not look like a failed turn (a tool that already ran shouldn't be
+    undone by a bookkeeping hiccup). Charges on dispatch-attempt; a tool that
+    failed still debits (rare, and the earn-back pass reconciles by outcome)."""
+    if drive_store is None:
+        return
+    costs = cost_for(action)
+    if not costs:
+        return
+    try:
+        await drive_store.spend(peer, action, costs)
+    except Exception as e:  # type-only — the provider/tool surface may carry text
+        log.error("spend failed action=%s exc=%s", action, type(e).__name__)

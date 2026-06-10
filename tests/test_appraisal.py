@@ -392,6 +392,7 @@ async def pool(pg_url):
     async with p.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("DROP TABLE IF EXISTS drive_state")
+            await cur.execute("DROP TABLE IF EXISTS drive_spend")
         await conn.commit()
     yield p
     await p.close()
@@ -611,3 +612,101 @@ async def test_connection_leaks_fast_on_its_own_half_life(pool):
     levels = await store.levels("EpeerD")
     # 0.3 leaked one (6h) half-life toward 0 → 0.15.
     assert levels["connection"] == pytest.approx(0.15, abs=1e-3)
+
+
+# --- spend ledger (slice b1) -----------------------------------------------
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_spend_debits_and_logs(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.3})  # bank 0.3
+    applied = await store.spend("EpeerD", "recall_memory", {"novelty": 0.1})
+    assert applied["novelty"] == pytest.approx(0.2, abs=1e-3)
+    assert (await store.levels("EpeerD"))["novelty"] == pytest.approx(0.2, abs=1e-3)
+    spends = await store.recent_spends("EpeerD")
+    assert len(spends) == 1
+    assert spends[0].action == "recall_memory"
+    assert spends[0].drive == "novelty"
+    assert spends[0].amount == pytest.approx(0.1)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_spend_floors_at_zero(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.1})
+    applied = await store.spend("EpeerD", "summarize_recent", {"novelty": 0.3})
+    assert applied["novelty"] == 0.0  # floored, never negative
+    # The action still happened → still logged.
+    assert len(await store.recent_spends("EpeerD")) == 1
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_spend_leaves_ema_reference(pool):
+    """Spending lowers the balance but NOT the rolling reference, so the drive
+    reads 'low for you' afterward — the deficit that motivates the next move."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.3})  # level 0.3, ema bootstraps 0.3
+    await store.spend("EpeerD", "reach_out", {"connection": 0.15})
+    reading = await store.state("EpeerD")
+    assert reading["connection"].level == pytest.approx(0.15, abs=1e-3)
+    assert reading["connection"].reference == pytest.approx(0.3, abs=1e-3)  # held
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_spend_from_empty_balance_logs_but_writes_no_row(pool):
+    store = await _store(pool)
+    applied = await store.spend("EpeerD", "set_mood", {"autonomy": 0.05})
+    assert applied["autonomy"] == 0.0
+    # No phantom drive_state row — the level reads back as the empty default…
+    assert (await store.levels("EpeerD"))["autonomy"] == 0.0
+    # …but the spend IS logged.
+    assert len(await store.recent_spends("EpeerD")) == 1
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_spend_ignores_unknown_and_nonpositive(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.3})
+    applied = await store.spend(
+        "EpeerD", "x", {"bogus": 0.1, "novelty": 0.0, "competence": -0.2}
+    )
+    assert applied == {}  # nothing valid → no-op
+    assert await store.recent_spends("EpeerD") == []  # and nothing logged
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_recent_spends_newest_first_and_bounded(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.3, "autonomy": 0.3})
+    await store.spend("EpeerD", "recall_memory", {"novelty": 0.05})
+    await store.spend("EpeerD", "set_mood", {"autonomy": 0.05})
+    spends = await store.recent_spends("EpeerD", limit=1)
+    assert len(spends) == 1
+    assert spends[0].action == "set_mood"  # newest first
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_forget_wipes_spend_log(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.3})
+    await store.spend("EpeerD", "recall_memory", {"novelty": 0.1})
+    await store.forget("EpeerD")
+    assert await store.recent_spends("EpeerD") == []
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_reset_wipes_spend_log(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.3})
+    await store.spend("EpeerD", "recall_memory", {"novelty": 0.1})
+    await store.reset()
+    assert await store.recent_spends("EpeerD") == []

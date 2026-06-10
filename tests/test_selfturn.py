@@ -104,6 +104,7 @@ class FakeDrives:
     def __init__(self, levels, references=None):
         self._levels = levels
         self._refs = references or {}
+        self.spends: list[tuple] = []
 
     async def state(self, peer):
         # Reference defaults to 0.0 → a non-zero level reads as off its norm,
@@ -113,6 +114,10 @@ class FakeDrives:
             k: DriveReading(v, self._refs.get(k, 0.0))
             for k, v in self._levels.items()
         }
+
+    async def spend(self, peer, action, costs):
+        self.spends.append((peer, action, dict(costs)))
+        return {}
 
 
 class FakeReflection:
@@ -224,11 +229,12 @@ async def test_runs_and_dispatches_inward_tool():
             ChatResult(content="settled in"),
         ]
     )
+    drives = FakeDrives({"connection": 0.2})
     loop = _loop(
         registry=ToolRegistry([tool]),
         provider=prov,
         impulses=FakeImpulses([("poke", "look into X")]),
-        drives=FakeDrives({"connection": 0.2}),
+        drives=drives,
     )
     await loop._maybe_self_turn("EpeerD", _NOW)
     assert prov.completes == 2
@@ -236,6 +242,9 @@ async def test_runs_and_dispatches_inward_tool():
     assert len(tool.calls) == 1
     assert tool.calls[0]["peer"] == "EpeerD"
     assert tool.calls[0]["name"] == "restless"
+    # Running the set_mood verb spent its drive currency (economy.COSTS) — the
+    # self-turn-verb-spends edge, charged at the run_tool_loop dispatch seam.
+    assert drives.spends == [("EpeerD", "set_mood", {"autonomy": 0.05})]
     # Min-gap advanced after the turn was spent.
     assert loop._last["EpeerD"] == _NOW
 
