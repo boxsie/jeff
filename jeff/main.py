@@ -162,14 +162,18 @@ async def handle_turn(
 
         # Jeff's current drive balance for this peer — surfaced into the prompt's
         # "## Your drives right now" block. Best-effort + additive: a store read
-        # fault must never break the reply, so fall back to no block. Levels are
-        # decayed-to-now in the store; here we just pair each drive's prose noun
-        # with its current level for the renderer.
+        # fault must never break the reply, so fall back to no block. Each drive's
+        # prose noun is paired with its leaked-to-now level AND its rolling EMA
+        # reference, so the renderer bands "high/low for you" against the personal
+        # baseline rather than an absolute (now-gone) ceiling.
         drives: list[tuple[str, float, float]] = []
         if drive_store is not None:
             try:
-                levels = await drive_store.levels(peer)
-                drives = [(d.noun, levels[d.key], d.baseline) for d in DRIVES]
+                reading = await drive_store.state(peer)
+                drives = [
+                    (d.noun, reading[d.key].level, reading[d.key].reference)
+                    for d in DRIVES
+                ]
             except Exception as e:
                 log.error("drives fetch failed peer=%s exc=%s", peer, type(e).__name__)
 

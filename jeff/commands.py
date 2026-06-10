@@ -401,15 +401,16 @@ def _format_remaining(seconds: float) -> str:
     return " ".join(parts) + " left"
 
 
-def _drive_band(level: float, baseline: float) -> str:
+def _drive_band(level: float, reference: float) -> str:
     """One-word band for a drive level in the `/mind` dump, judged relative to the
-    drive's baseline (matches the prompt block's ``DRIVE_BAND_MARGIN`` so the
-    operator view and what Jeff sees stay aligned)."""
+    drive's rolling EMA reference — its personal baseline (matches the prompt
+    block's ``DRIVE_BAND_MARGIN`` so the operator view and what Jeff sees stay
+    aligned)."""
     from .prompt import DRIVE_BAND_MARGIN
 
-    if level >= baseline + DRIVE_BAND_MARGIN:
+    if level >= reference + DRIVE_BAND_MARGIN:
         return "well-met"
-    if level <= baseline - DRIVE_BAND_MARGIN:
+    if level <= reference - DRIVE_BAND_MARGIN:
         return "running low"
     return "steady"
 
@@ -597,13 +598,17 @@ async def _cmd_mind(ctx: CommandContext) -> str:
     if ctx.drives is not None:
         from .appraisal import DRIVES
 
-        levels = await ctx.drives.levels(ctx.peer)
+        reading = await ctx.drives.state(ctx.peer)
         lines = ["drives:"]
-        # Show each drive's decayed-to-now level plus a one-word band, so the
-        # operator can see the balance the appraisal pass is steering.
+        # Show each drive's leaked-to-now balance, its rolling reference (the
+        # personal baseline it's judged against), and a one-word band — so the
+        # operator sees both the balance the appraisal pass is steering and where
+        # it sits relative to Jeff's recent norm (uncapped, so the number can
+        # exceed 1).
         lines.extend(
-            f"  • {d.noun}: {levels[d.key]:.2f} "
-            f"({_drive_band(levels[d.key], d.baseline)})"
+            f"  • {d.noun}: {reading[d.key].level:.2f} "
+            f"({_drive_band(reading[d.key].level, reading[d.key].reference)}, "
+            f"avg {reading[d.key].reference:.2f})"
             for d in DRIVES
         )
         sections.append("\n".join(lines))

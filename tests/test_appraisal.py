@@ -17,11 +17,14 @@ from jeff.appraisal import (
     DRIVES,
     MAX_DELTA_STEP,
     AppraisalDriver,
+    DriveReading,
     DriveState,
+    _EMA_HALF_LIFE_SECONDS,
     _build_user_block,
     _parse_appraisal,
-    clamp_unit,
     decay_toward_baseline,
+    ema_step,
+    floor_at_zero,
 )
 from jeff.config import Config
 from jeff.prompt import _render_drives
@@ -54,10 +57,12 @@ def _cfg(**extra) -> Config:
 # --- pure tests: decay math -------------------------------------------------
 
 
-def test_clamp_unit_bounds():
-    assert clamp_unit(-0.4) == 0.0
-    assert clamp_unit(1.7) == 1.0
-    assert clamp_unit(0.3) == 0.3
+def test_floor_at_zero():
+    # Floored below, UNCAPPED above (the drivemaxxing ceiling is gone).
+    assert floor_at_zero(-0.4) == 0.0
+    assert floor_at_zero(0.0) == 0.0
+    assert floor_at_zero(0.3) == 0.3
+    assert floor_at_zero(1.7) == 1.7
 
 
 def test_decay_halves_gap_each_half_life():
@@ -69,36 +74,68 @@ def test_decay_halves_gap_each_half_life():
     ) == pytest.approx(0.625)
 
 
-def test_decay_pulls_up_from_below_baseline():
-    # A depleted drive relaxes UP toward the baseline too.
-    assert decay_toward_baseline(0.0, 0.5, _HALF_LIFE_SECONDS, _HALF_LIFE_SECONDS) == 0.25
+def test_decay_leaks_toward_zero_baseline():
+    # The currency model: baseline 0 → decay IS leak ∝ balance (one half-life
+    # halves the balance). This is what every production drive does now.
+    assert decay_toward_baseline(1.0, 0.0, _HALF_LIFE_SECONDS, _HALF_LIFE_SECONDS) == 0.5
+    assert decay_toward_baseline(2.4, 0.0, _HALF_LIFE_SECONDS, _HALF_LIFE_SECONDS) == 1.2
 
 
 def test_decay_zero_elapsed_is_identity():
     assert decay_toward_baseline(0.9, 0.5, 0.0, _HALF_LIFE_SECONDS) == 0.9
 
 
-def test_decay_nonpositive_half_life_is_identity_clamped():
-    # half_life <= 0 means "no decay"; still clamps a bad level into range.
+def test_decay_nonpositive_half_life_is_identity_floored():
+    # half_life <= 0 means "no decay"; floors a negative but never caps above.
     assert decay_toward_baseline(0.8, 0.5, _HALF_LIFE_SECONDS, 0.0) == 0.8
-    assert decay_toward_baseline(1.5, 0.5, _HALF_LIFE_SECONDS, 0.0) == 1.0
+    assert decay_toward_baseline(1.5, 0.5, _HALF_LIFE_SECONDS, 0.0) == 1.5
+    assert decay_toward_baseline(-0.2, 0.5, _HALF_LIFE_SECONDS, 0.0) == 0.0
 
 
-def test_decay_clamps_result_into_range():
-    # An out-of-range baseline can't leak a >1 value into the prompt.
-    assert decay_toward_baseline(1.0, 2.0, _HALF_LIFE_SECONDS, _HALF_LIFE_SECONDS) == 1.0
+def test_decay_does_not_cap_above_one():
+    # An uncapped balance stays uncapped through decay — no 1.0 ceiling anymore.
+    assert decay_toward_baseline(3.0, 0.0, 0.0, _HALF_LIFE_SECONDS) == 3.0
+    assert decay_toward_baseline(
+        3.0, 0.0, _HALF_LIFE_SECONDS, _HALF_LIFE_SECONDS
+    ) == 1.5
 
 
-def test_connection_rests_low_and_decays_fast():
-    # The proactivity tune: connection rests at a LOW baseline so silence depletes
-    # it into a reach-out deficit, and has a SHORTER half-life than the rest.
-    conn = next(d for d in DRIVES if d.key == "connection")
-    assert conn.baseline == 0.2
+def test_all_baselines_zero_and_connection_leaks_fast():
+    # Currency model: every drive's baseline is 0 (the leak target). connection
+    # keeps a SHORTER half-life so it tracks very recent contact.
+    assert all(d.baseline == 0.0 for d in DRIVES)
     # Per-drive half-life override beats the store's global default; other drives
     # fall back to it (None override).
     store = DriveState(None, half_life_hours=24.0)  # type: ignore[arg-type]
     assert store._half_life_for("connection") == 6.0 * 3600.0
     assert store._half_life_for("novelty") == 24.0 * 3600.0
+
+
+# --- pure tests: the EMA reference (rolling personal baseline) ---------------
+
+
+def test_ema_step_zero_elapsed_holds_reference():
+    # No time passed → the reference doesn't move.
+    assert ema_step(0.5, 0.9, 0.0, _EMA_HALF_LIFE_SECONDS) == 0.5
+
+
+def test_ema_step_one_half_life_is_midpoint():
+    # w = 0.5 after one half-life → halfway between prev average and new sample.
+    assert ema_step(
+        0.4, 0.8, _EMA_HALF_LIFE_SECONDS, _EMA_HALF_LIFE_SECONDS
+    ) == pytest.approx(0.6)
+
+
+def test_ema_step_no_smoothing_snaps_to_sample():
+    # half_life <= 0 → no smoothing, reference == latest sample.
+    assert ema_step(0.4, 0.8, _EMA_HALF_LIFE_SECONDS, 0.0) == 0.8
+
+
+def test_ema_step_forgets_old_average_over_many_half_lives():
+    # Far in the future the old average is nearly fully forgotten.
+    assert ema_step(
+        0.4, 0.8, 10 * _EMA_HALF_LIFE_SECONDS, _EMA_HALF_LIFE_SECONDS
+    ) == pytest.approx(0.8, abs=1e-3)
 
 
 # --- pure tests: appraisal parsing ------------------------------------------
@@ -366,37 +403,59 @@ async def _store(pool, *, half_life_hours: float = 24.0) -> DriveState:
 
 @pytestmark_db
 @pytest.mark.asyncio
-async def test_levels_default_to_baseline(pool):
+async def test_levels_default_to_empty(pool):
     store = await _store(pool)
     levels = await store.levels("EpeerD")
     assert set(levels) == {d.key for d in DRIVES}
-    # Each never-appraised drive reads back at ITS OWN baseline (connection rests
-    # low at 0.2, the rest at 0.5).
-    assert all(levels[d.key] == d.baseline for d in DRIVES)
+    # A never-appraised drive reads back EMPTY (baseline 0) — no balance yet.
+    assert all(levels[d.key] == 0.0 for d in DRIVES)
 
 
 @pytestmark_db
 @pytest.mark.asyncio
-async def test_apply_adds_delta_from_baseline(pool):
+async def test_state_default_reading_is_zero_zero(pool):
     store = await _store(pool)
-    # Use 0.5-baseline drives so this exercises generic add-from-baseline mechanics
-    # (connection's low baseline is covered by its own test below).
+    reading = await store.state("EpeerD")
+    assert set(reading) == {d.key for d in DRIVES}
+    # No balance, no personal norm yet → (level 0, reference 0) → unremarkable.
+    assert all(reading[d.key] == DriveReading(0.0, 0.0) for d in DRIVES)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_apply_adds_delta_from_empty_and_floors(pool):
+    store = await _store(pool)
     applied = await store.apply("EpeerD", {"competence": 0.2, "novelty": -0.1})
-    assert applied["competence"] == pytest.approx(0.7)
-    assert applied["novelty"] == pytest.approx(0.4)
+    assert applied["competence"] == pytest.approx(0.2)  # 0 + 0.2
+    assert applied["novelty"] == 0.0  # floor(0 - 0.1) — can't go negative
     levels = await store.levels("EpeerD")
-    assert levels["competence"] == pytest.approx(0.7, abs=1e-3)
-    assert levels["autonomy"] == 0.5  # untouched → baseline
+    assert levels["competence"] == pytest.approx(0.2, abs=1e-3)
+    assert levels["autonomy"] == 0.0  # untouched → empty
 
 
 @pytestmark_db
 @pytest.mark.asyncio
-async def test_apply_clamps_to_unit_and_bounds_delta(pool):
+async def test_apply_is_uncapped_above(pool):
+    """No 1.0 ceiling: repeated income accumulates past 1.0 (the drivemaxxing fix).
+    Rapid successive applies have ~0 elapsed, so leak is negligible between them."""
     store = await _store(pool)
-    # Two +0.3 steps from 0.5 → 0.8 then clamp(1.1) = 1.0.
-    await store.apply("EpeerD", {"competence": 5.0})  # clamped to +0.3 → 0.8
-    second = await store.apply("EpeerD", {"competence": 5.0})  # +0.3 → clamp 1.0
-    assert second["competence"] == 1.0
+    applied = {}
+    for _ in range(5):
+        applied = await store.apply("EpeerD", {"competence": 0.3})
+    # 5 × 0.3 ≈ 1.5 — comfortably above the old 1.0 cap.
+    assert applied["competence"] == pytest.approx(1.5, abs=1e-2)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_apply_bounds_single_delta_but_not_total(pool):
+    store = await _store(pool)
+    # A single huge delta is still clamped to MAX_DELTA_STEP per turn…
+    first = await store.apply("EpeerD", {"competence": 5.0})
+    assert first["competence"] == pytest.approx(MAX_DELTA_STEP)
+    # …but the running total is uncapped (another +0.3 → 0.6, no ceiling).
+    second = await store.apply("EpeerD", {"competence": 5.0})
+    assert second["competence"] == pytest.approx(2 * MAX_DELTA_STEP, abs=1e-2)
 
 
 @pytestmark_db
@@ -404,18 +463,17 @@ async def test_apply_clamps_to_unit_and_bounds_delta(pool):
 async def test_apply_ignores_unknown_drive(pool):
     store = await _store(pool)
     applied = await store.apply("EpeerD", {"bogus": 0.3, "autonomy": 0.1})
-    assert applied == {"autonomy": pytest.approx(0.6)}
+    assert applied == {"autonomy": pytest.approx(0.1)}
 
 
 @pytestmark_db
 @pytest.mark.asyncio
-async def test_levels_decays_aged_row_toward_baseline(pool):
-    """A row last updated one half-life ago reads back halfway to baseline — the
-    DB clock drives elapsed, the Python curve does the rest (deterministic)."""
+async def test_levels_leak_aged_row_toward_zero(pool):
+    """A row last updated one half-life ago reads back at half its balance — leak
+    ∝ balance. The DB clock drives elapsed, the Python curve does the rest."""
     store = await _store(pool, half_life_hours=24.0)
-    await store.apply("EpeerD", {"novelty": 0.3})  # 0.5 → 0.8
-    # Age the row by exactly one half-life via SQL so elapsed is deterministic.
-    # novelty rests at 0.5 with the store's global 24h half-life (no override).
+    await store.apply("EpeerD", {"novelty": 0.3})  # 0 → 0.3
+    # Age the row by exactly one (24h) half-life so elapsed is deterministic.
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -425,17 +483,17 @@ async def test_levels_decays_aged_row_toward_baseline(pool):
             )
         await conn.commit()
     levels = await store.levels("EpeerD")
-    # 0.8 decayed one half-life toward 0.5 → 0.5 + 0.3*0.5 = 0.65.
-    assert levels["novelty"] == pytest.approx(0.65, abs=1e-3)
+    # 0.3 leaked one half-life toward 0 → 0.15.
+    assert levels["novelty"] == pytest.approx(0.15, abs=1e-3)
 
 
 @pytestmark_db
 @pytest.mark.asyncio
-async def test_apply_decays_before_adding_delta(pool):
-    """apply() relaxes the stored level to now BEFORE adding the new delta, so an
-    aged high doesn't compound from its stale value."""
+async def test_apply_leaks_before_adding_delta(pool):
+    """apply() leaks the stored level to now BEFORE adding the new delta, so an
+    aged balance doesn't compound from its stale value."""
     store = await _store(pool, half_life_hours=24.0)
-    await store.apply("EpeerD", {"novelty": 0.3})  # 0.5 → 0.8
+    await store.apply("EpeerD", {"novelty": 0.3})  # 0 → 0.3
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -444,9 +502,67 @@ async def test_apply_decays_before_adding_delta(pool):
                 ("EpeerD", "novelty"),
             )
         await conn.commit()
-    # Decays 0.8 → 0.65 first, THEN adds +0.1 → 0.75 (not 0.9).
+    # Leaks 0.3 → 0.15 first, THEN adds +0.1 → 0.25 (not 0.4).
     applied = await store.apply("EpeerD", {"novelty": 0.1})
-    assert applied["novelty"] == pytest.approx(0.75, abs=1e-3)
+    assert applied["novelty"] == pytest.approx(0.25, abs=1e-3)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_ema_bootstraps_to_level_on_first_apply(pool):
+    """First time a drive is fed there's no history to average, so its EMA
+    reference bootstraps to the new level (level == reference → unremarkable)."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.3})
+    reading = await store.state("EpeerD")
+    assert reading["novelty"].level == pytest.approx(0.3, abs=1e-3)
+    assert reading["novelty"].reference == pytest.approx(0.3, abs=1e-3)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_reference_holds_while_level_leaks_away(pool):
+    """The 'low for you' signal: after going quiet the fast level leaks toward 0
+    but the stored EMA reference is NOT leaked at read, so the gap opens up."""
+    store = await _store(pool, half_life_hours=24.0)
+    # A single +0.3 (the per-turn MAX_DELTA_STEP) → level 0.3, ema bootstraps 0.3.
+    await store.apply("EpeerD", {"novelty": 0.3})
+    # Go quiet for three half-lives.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE drive_state SET updated_at = now() - interval '72 hours' "
+                "WHERE peer = %s AND drive = %s",
+                ("EpeerD", "novelty"),
+            )
+        await conn.commit()
+    reading = await store.state("EpeerD")
+    # Level leaked 0.3 · 0.5^3 = 0.0375; reference still reflects the recent norm.
+    assert reading["novelty"].level == pytest.approx(0.0375, abs=1e-3)
+    assert reading["novelty"].reference == pytest.approx(0.3, abs=1e-3)
+    # The gap is wide enough to read "low for you" (> the prompt's band margin).
+    assert reading["novelty"].reference - reading["novelty"].level > 0.15
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_null_ema_bootstraps_reference_to_level(pool):
+    """Migration path: a row written before the ema column existed (NULL ema)
+    reads back with its reference bootstrapped to the leaked-to-now level."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.4})
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE drive_state SET ema = NULL "
+                "WHERE peer = %s AND drive = %s",
+                ("EpeerD", "novelty"),
+            )
+        await conn.commit()
+    reading = await store.state("EpeerD")
+    assert reading["novelty"].reference == pytest.approx(
+        reading["novelty"].level, abs=1e-3
+    )
 
 
 @pytestmark_db
@@ -458,9 +574,9 @@ async def test_forget_wipes_one_peer(pool):
 
     deleted = await store.forget("EpeerD")
     assert deleted == 2  # two drive rows for EpeerD
-    # EpeerD reads back at baseline (no rows); EotherD untouched.
-    assert (await store.levels("EpeerD"))["novelty"] == 0.5
-    assert (await store.levels("EotherD"))["novelty"] == pytest.approx(0.7, abs=1e-3)
+    # EpeerD reads back empty (no rows); EotherD untouched.
+    assert (await store.levels("EpeerD"))["novelty"] == 0.0
+    assert (await store.levels("EotherD"))["novelty"] == pytest.approx(0.2, abs=1e-3)
 
 
 @pytestmark_db
@@ -469,20 +585,20 @@ async def test_reset_wipes_and_recreates(pool):
     store = await _store(pool)
     await store.apply("EpeerD", {"novelty": 0.2})
     await store.reset()
-    assert (await store.levels("EpeerD"))["novelty"] == 0.5
+    assert (await store.levels("EpeerD"))["novelty"] == 0.0
     # Usable after reset.
     applied = await store.apply("EpeerD", {"novelty": 0.1})
-    assert applied["novelty"] == pytest.approx(0.6)
+    assert applied["novelty"] == pytest.approx(0.1)
 
 
 @pytestmark_db
 @pytest.mark.asyncio
-async def test_connection_decays_toward_low_baseline_on_its_own_half_life(pool):
-    """End-to-end: connection rests at 0.2 and uses its 6h half-life override, so a
-    bumped-up connection relaxes back DOWN toward 0.2 (the reach-out deficit) — even
-    though the store's global half-life is 24h."""
+async def test_connection_leaks_fast_on_its_own_half_life(pool):
+    """End-to-end: connection uses its 6h half-life override, so a fed connection
+    leaks back toward 0 FAST (the reach-out deficit) — even though the store's
+    global half-life is 24h."""
     store = await _store(pool, half_life_hours=24.0)
-    await store.apply("EpeerD", {"connection": 0.3})  # 0.2 → 0.5
+    await store.apply("EpeerD", {"connection": 0.3})  # 0 → 0.3
     # Age by exactly one connection half-life (6h), not the store's 24h.
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
@@ -493,5 +609,5 @@ async def test_connection_decays_toward_low_baseline_on_its_own_half_life(pool):
             )
         await conn.commit()
     levels = await store.levels("EpeerD")
-    # 0.5 decayed one (6h) half-life toward 0.2 → 0.2 + 0.3*0.5 = 0.35.
-    assert levels["connection"] == pytest.approx(0.35, abs=1e-3)
+    # 0.3 leaked one (6h) half-life toward 0 → 0.15.
+    assert levels["connection"] == pytest.approx(0.15, abs=1e-3)

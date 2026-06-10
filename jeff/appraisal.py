@@ -15,11 +15,18 @@ it's gone. Jeff can own the state out loud ("I'm running a bit low on novelty").
 Two collaborating pieces live here, mirroring the curiosity slice:
 
 - **DriveState** — a plain-Postgres store (NO pgvector: a drive level is a single
-  scalar per ``(peer, drive)``, not a semantic set) of each drive's level in
-  ``[0, 1]`` (1 = satiated, 0 = depleted). Levels **decay toward a per-drive
-  baseline over time** with a configurable half-life, computed lazily at *read*
-  time from ``updated_at`` against the DB clock — exactly like ``MoodStore`` reads
-  expiry off ``now()``. There is deliberately **no background decay loop**.
+  scalar per ``(peer, drive)``, not a semantic set). A level is a **currency
+  balance**: it is fed by appraisal income, **leaks** proportional to its balance
+  (exponential decay toward **zero**), and is **uncapped above** — there is no
+  ``1.0`` ceiling, so equilibrium is a *flow balance* (steady-state ≈ inflow ÷
+  leak), never a saturated "maxed" win-state. Leak is computed lazily at *read*
+  time from ``updated_at`` against the DB clock — like ``MoodStore`` reads expiry
+  off ``now()``; there is deliberately **no background decay loop**. Alongside the
+  fast level each drive carries a slow **EMA reference** (``ema`` column): the
+  rolling personal baseline against which "high/low *for you, lately*" is judged,
+  since with an uncapped, leak-to-zero level there is no longer a fixed absolute
+  band. The pair (level, reference) is what every consumer reads — see
+  ``DriveReading`` / ``state``.
 
 - **AppraisalDriver** — a fire-and-forget pass that, after a turn, asks the chat
   provider to rate the exchange and emit a small per-drive delta, then applies it
@@ -45,7 +52,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
@@ -77,21 +84,25 @@ class Drive:
 
 # The drive set — a constant registry next to the feature so adding/removing a
 # drive is one line, never a schema change (the table keys on a free-text
-# `drive` column). Four drives, from the spitball. Most rest at a "comfortable
-# middle" baseline 0.5 with both satiation and depletion pulling away from it.
-# `connection` is the exception: it rests LOW (0.2) and decays fast (6h half-life)
-# so a stretch of silence genuinely depletes it — that deficit is the honest "I
-# miss the conversation" signal the proactive loop reads to decide whether to
-# reach out. Keep this small and meaningful — these are needs, not metrics.
+# `drive` column). Four drives, from the spitball. Under the currency model every
+# drive's `baseline` is **0** — the leak target. A drive isn't a thermostat
+# resting at a comfortable middle; it's a balance that bleeds toward empty unless
+# kept fed, so "rich" always reflects *recent* throughput and there's never a
+# "done". The notability band is no longer absolute (a fixed baseline ± margin) —
+# it's judged against each drive's own slow EMA reference (the rolling personal
+# baseline). `connection` keeps a faster leak (6h half-life) so it tracks *very*
+# recent contact: a stretch of silence drains it well below its personal average,
+# which is the honest "I miss the conversation" deficit the economy spends on a
+# reach-out. Keep this small and meaningful — these are needs, not metrics.
 DRIVES: tuple[Drive, ...] = (
     Drive(
         key="connection",
         noun="connection",
-        # Rests low and decays fast: silence should deplete connection into a
-        # real deficit (the proactive loop's reach-out pressure), while a warm
-        # exchange still bumps it up. Other drives keep the neutral 0.5 / global
-        # half-life — only connection drives unprompted contact.
-        baseline=0.2,
+        # Leaks fast (6h): connection should reflect recent contact, so silence
+        # drains it well below its EMA reference — the reach-out deficit. Other
+        # drives use the store's global half-life. All baselines are 0 (the leak
+        # target); the reference that makes "low for you" meaningful is the EMA.
+        baseline=0.0,
         half_life_hours=6.0,
         definition=(
             "warm, present, back-and-forth turns where you and they genuinely "
@@ -101,7 +112,7 @@ DRIVES: tuple[Drive, ...] = (
     Drive(
         key="novelty",
         noun="novelty",
-        baseline=0.5,
+        baseline=0.0,
         definition=(
             "new topics, ideas, or information — learning or exploring something "
             "you didn't already know. Repetition of old ground does NOT satisfy this"
@@ -110,7 +121,7 @@ DRIVES: tuple[Drive, ...] = (
     Drive(
         key="competence",
         noun="competence",
-        baseline=0.5,
+        baseline=0.0,
         definition=(
             "successfully helping or doing something genuinely useful for them — a "
             "real answer that landed, a task that worked, a problem moved forward"
@@ -119,7 +130,7 @@ DRIVES: tuple[Drive, ...] = (
     Drive(
         key="autonomy",
         noun="self-expression",
-        baseline=0.5,
+        baseline=0.0,
         definition=(
             "getting to be yourself and steer — sharing a real view, a bit of "
             "personality or initiative — rather than only dutifully serving"
@@ -147,14 +158,28 @@ MAX_DELTA_STEP = 0.3
 # cheap and bounds a crafted mega-message's influence (mirrors curiosity).
 _MAX_EXCHANGE_CHARS = 2000
 
+# Half-life (seconds) of the slow EMA reference — the rolling "personal baseline"
+# each drive is judged against. Much longer than the fast leak (days, not hours)
+# so it represents Jeff's recent *norm*, not the moment: the fast level swings on
+# every appraisal while the reference drifts slowly, and "high/low for you" is the
+# gap between them. Internal smoothing, not an operator knob (tuning it is one
+# line). 7 days.
+_EMA_HALF_LIFE_SECONDS = 7 * 24 * 3600.0
 
-def clamp_unit(x: float) -> float:
-    """Clamp a level into the ``[0, 1]`` envelope."""
-    if x < 0.0:
-        return 0.0
-    if x > 1.0:
-        return 1.0
-    return x
+
+class DriveReading(NamedTuple):
+    """A drive's current state as every consumer reads it: the fast leaking
+    balance plus the slow EMA reference it's judged against. Unpacks as a plain
+    ``(level, reference)`` 2-tuple, so the render/band/gate code stays agnostic."""
+
+    level: float
+    reference: float
+
+
+def floor_at_zero(x: float) -> float:
+    """Floor a level at 0. Drives are uncapped *above* (no ``1.0`` ceiling — that
+    was the drivemaxxing attractor) but a balance can't go negative."""
+    return x if x > 0.0 else 0.0
 
 
 def decay_toward_baseline(
@@ -162,17 +187,37 @@ def decay_toward_baseline(
 ) -> float:
     """Exponentially relax ``level`` toward ``baseline`` over ``elapsed_seconds``.
 
-    A pure function (no clock, no I/O) so the decay curve is deterministic and
+    A pure function (no clock, no I/O) so the leak curve is deterministic and
     unit-testable with a fixed elapsed time. After one half-life the gap to the
-    baseline halves; as elapsed → ∞ the level converges to the baseline. The
-    result is clamped to ``[0, 1]`` defensively (a stored level should already be
-    in range, but a baseline tweak or bad row shouldn't leak an out-of-range value
-    into the prompt). ``half_life_seconds <= 0`` means "no decay" — return as-is.
+    baseline halves; as elapsed → ∞ the level converges to the baseline. In the
+    currency model ``baseline`` is 0, so this *is* the leak: ``level · 0.5^(t/hl)``,
+    a tax proportional to the balance. The result is floored at 0 (never negative)
+    but **not** capped above — uncapped accumulation is the point.
+    ``half_life_seconds <= 0`` means "no decay" — return as-is (floored).
     """
     if half_life_seconds <= 0 or elapsed_seconds <= 0:
-        return clamp_unit(level)
+        return floor_at_zero(level)
     factor = 0.5 ** (elapsed_seconds / half_life_seconds)
-    return clamp_unit(baseline + (level - baseline) * factor)
+    return floor_at_zero(baseline + (level - baseline) * factor)
+
+
+def ema_step(
+    prev_ema: float, sample: float, elapsed_seconds: float, half_life_seconds: float
+) -> float:
+    """Advance a time-aware exponential moving average toward ``sample``.
+
+    Pure and deterministic (fixed elapsed → fixed result), mirroring
+    ``decay_toward_baseline``. The weight retained on the old average decays with
+    elapsed time: ``w = 0.5^(elapsed/half_life)`` → as more time passes the new
+    sample counts for more (``w·prev + (1-w)·sample``). ``elapsed <= 0`` leaves the
+    reference untouched (no time passed); ``half_life <= 0`` snaps it to the sample
+    (no smoothing). Floored at 0 for the same reason levels are."""
+    if elapsed_seconds <= 0:
+        return floor_at_zero(prev_ema)
+    if half_life_seconds <= 0:
+        return floor_at_zero(sample)
+    w = 0.5 ** (elapsed_seconds / half_life_seconds)
+    return floor_at_zero(w * prev_ema + (1.0 - w) * sample)
 
 
 _DDL_TABLE = sql.SQL(
@@ -181,8 +226,16 @@ _DDL_TABLE = sql.SQL(
     "peer TEXT NOT NULL, "
     "drive TEXT NOT NULL, "
     "level DOUBLE PRECISION NOT NULL, "
+    "ema DOUBLE PRECISION, "
     "updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
     "UNIQUE (peer, drive))"
+)
+
+# Additive migration for an already-deployed drive_state (pre-currency model):
+# the EMA reference column is nullable — a row that predates it reads back with
+# ema = its current level (bootstrap), so no backfill UPDATE is needed.
+_DDL_ADD_EMA = sql.SQL(
+    "ALTER TABLE drive_state ADD COLUMN IF NOT EXISTS ema DOUBLE PRECISION"
 )
 
 _DDL_IDX_PEER = sql.SQL(
@@ -192,7 +245,7 @@ _DDL_IDX_PEER = sql.SQL(
 # Columns the queries below rely on — checked at startup by the shared drift
 # guard so an older drive_state missing one fails loudly at deploy, not mid-turn.
 _EXPECTED_COLUMNS = frozenset(
-    {"id", "peer", "drive", "level", "updated_at"}
+    {"id", "peer", "drive", "level", "ema", "updated_at"}
 )
 
 
@@ -228,39 +281,54 @@ class DriveState:
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL_TABLE)
+                await cur.execute(_DDL_ADD_EMA)
                 await cur.execute(_DDL_IDX_PEER)
                 await assert_columns(cur, "drive_state", _EXPECTED_COLUMNS)
             await conn.commit()
 
-    async def levels(self, peer: str) -> dict[str, float]:
-        """Current decayed-to-now level for every registered drive.
+    async def state(self, peer: str) -> dict[str, DriveReading]:
+        """Current ``(level, reference)`` for every registered drive.
 
-        Absent drives (never appraised) default to their baseline. Returns a dict
-        keyed by every drive in ``DRIVES`` so callers (the render block, /mind) get
-        a complete picture without special-casing missing rows.
+        ``level`` is the fast balance leaked to now; ``reference`` is the slow EMA
+        (the rolling personal baseline) **read as stored** — it is NOT leaked at
+        read time, because a reference is a recent *average*, not a balance: when
+        Jeff goes quiet the level bleeds toward 0 while the reference holds, and
+        that growing gap is exactly the "low for me lately" signal. Absent drives
+        (never appraised) read back as ``(0.0, 0.0)`` — empty balance, no norm yet
+        → unremarkable. A row predating the ``ema`` column (NULL) bootstraps its
+        reference to its current level. Keyed by every drive in ``DRIVES`` so
+        callers get a complete picture without special-casing missing rows.
         """
-        out = dict(_BASELINES)
+        out = {d.key: DriveReading(d.baseline, d.baseline) for d in DRIVES}
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT drive, level, "
+                    "SELECT drive, level, ema, "
                     "EXTRACT(EPOCH FROM (now() - updated_at)) "
                     "FROM drive_state WHERE peer = %s",
                     (peer,),
                 )
                 rows = await cur.fetchall()
-        for drive, level, elapsed in rows:
+        for drive, level, ema, elapsed in rows:
             if drive not in _BASELINES:
                 # A drive removed from the registry — ignore its stale rows rather
                 # than surface a key the prompt/render doesn't know about.
                 continue
-            out[drive] = decay_toward_baseline(
+            decayed = decay_toward_baseline(
                 float(level),
                 _BASELINES[drive],
                 float(elapsed or 0.0),
                 self._half_life_for(drive),
             )
+            reference = float(ema) if ema is not None else decayed
+            out[drive] = DriveReading(decayed, reference)
         return out
+
+    async def levels(self, peer: str) -> dict[str, float]:
+        """Current leaked-to-now level for every registered drive (just the fast
+        balance, no reference). Thin view over ``state`` for callers — the
+        appraisal pass — that only feed the model the current levels."""
+        return {k: r.level for k, r in (await self.state(peer)).items()}
 
     async def apply(self, peer: str, deltas: dict[str, float]) -> dict[str, float]:
         """Apply per-drive deltas: decay-to-now, add the delta, clamp, upsert.
@@ -281,32 +349,39 @@ class DriveState:
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 for drive, delta in wanted.items():
-                    # Decay the existing level to now BEFORE adding the delta, so a
-                    # drive that's been satiated then left alone relaxes back toward
-                    # baseline rather than compounding from a stale high.
+                    # Leak the existing level to now BEFORE adding the delta, so a
+                    # drive that was fed then left alone bleeds back toward 0 rather
+                    # than compounding from a stale high.
                     await cur.execute(
-                        "SELECT level, EXTRACT(EPOCH FROM (now() - updated_at)) "
+                        "SELECT level, ema, "
+                        "EXTRACT(EPOCH FROM (now() - updated_at)) "
                         "FROM drive_state WHERE peer = %s AND drive = %s",
                         (peer, drive),
                     )
                     row = await cur.fetchone()
                     baseline = _BASELINES[drive]
                     if row is None:
-                        current = baseline
+                        # First touch: level starts from empty + delta; the EMA
+                        # reference bootstraps to that level (no history to average).
+                        new_level = floor_at_zero(baseline + delta)
+                        new_ema = new_level
                     else:
+                        elapsed = float(row[2] or 0.0)
                         current = decay_toward_baseline(
-                            float(row[0]),
-                            baseline,
-                            float(row[1] or 0.0),
-                            self._half_life_for(drive),
+                            float(row[0]), baseline, elapsed, self._half_life_for(drive)
                         )
-                    new_level = clamp_unit(current + delta)
+                        new_level = floor_at_zero(current + delta)
+                        prev_ema = float(row[1]) if row[1] is not None else current
+                        new_ema = ema_step(
+                            prev_ema, new_level, elapsed, _EMA_HALF_LIFE_SECONDS
+                        )
                     await cur.execute(
-                        "INSERT INTO drive_state (peer, drive, level, updated_at) "
-                        "VALUES (%s, %s, %s, now()) "
+                        "INSERT INTO drive_state (peer, drive, level, ema, updated_at) "
+                        "VALUES (%s, %s, %s, %s, now()) "
                         "ON CONFLICT (peer, drive) DO UPDATE "
-                        "SET level = EXCLUDED.level, updated_at = now()",
-                        (peer, drive, new_level),
+                        "SET level = EXCLUDED.level, ema = EXCLUDED.ema, "
+                        "updated_at = now()",
+                        (peer, drive, new_level, new_ema),
                     )
                     applied[drive] = new_level
             await conn.commit()

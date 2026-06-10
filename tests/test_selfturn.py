@@ -15,6 +15,7 @@ from typing import ClassVar
 
 import pytest
 
+from jeff.appraisal import DriveReading
 from jeff.chat_types import ChatResult, ToolCall
 from jeff.selfturn import (
     _SELF_TURN_INSTRUCTION,
@@ -100,11 +101,18 @@ class FakeImpulses:
 
 
 class FakeDrives:
-    def __init__(self, levels):
+    def __init__(self, levels, references=None):
         self._levels = levels
+        self._refs = references or {}
 
-    async def levels(self, peer):
-        return dict(self._levels)
+    async def state(self, peer):
+        # Reference defaults to 0.0 → a non-zero level reads as off its norm,
+        # which is what the off-reference gate keys on. Pass `references` to put a
+        # drive AT its norm (level == reference → unremarkable).
+        return {
+            k: DriveReading(v, self._refs.get(k, 0.0))
+            for k, v in self._levels.items()
+        }
 
 
 class FakeReflection:
@@ -169,7 +177,7 @@ async def test_skip_when_nothing_to_chew_on():
         provider=prov,
         curiosity=FakeCuriosity([]),
         impulses=FakeImpulses([]),
-        drives=FakeDrives({}),  # absent → levels default to baseline → on-baseline
+        drives=FakeDrives({}),  # no drive rows → nothing off its norm
     )
     await loop._maybe_self_turn("EpeerD", _NOW)
     assert prov.completes == 0
@@ -233,15 +241,15 @@ async def test_runs_and_dispatches_inward_tool():
 
 
 @pytest.mark.asyncio
-async def test_runs_even_when_drive_off_baseline_only():
-    # No impulses, no curiosities — but a drive sits well off baseline → chew.
+async def test_runs_even_when_drive_off_reference_only():
+    # No impulses, no curiosities — but a drive sits well off its norm → chew.
     prov = FakeProvider()  # model decides to do nothing (no tool calls)
     loop = _loop(
         registry=ToolRegistry([RecordMoodTool()]),
         provider=prov,
         curiosity=FakeCuriosity([]),
         impulses=FakeImpulses([]),
-        drives=FakeDrives({"connection": 0.95}),  # baseline 0.2 → way off
+        drives=FakeDrives({"connection": 0.95}),  # level 0.95 vs ref 0.0 → way off
     )
     await loop._maybe_self_turn("EpeerD", _NOW)
     assert prov.completes == 1

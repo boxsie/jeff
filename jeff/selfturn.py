@@ -24,7 +24,7 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from .appraisal import DRIVES
+from .appraisal import DRIVES, DriveReading
 from .prompt import DRIVE_BAND_MARGIN, build_self_turn_messages
 from .turnloop import run_tool_loop
 
@@ -169,16 +169,21 @@ class SelfTurnLoop:
                 if self._curiosity
                 else []
             )
-            levels = await self._drives.levels(peer) if self._drives else {}
-            off_baseline = any(
-                abs(levels.get(d.key, d.baseline) - d.baseline) > DRIVE_BAND_MARGIN
+            reading = await self._drives.state(peer) if self._drives else {}
+            # A drive is worth chewing on when it sits off its *personal* reference
+            # (the rolling EMA), not off some absolute mark — "low/high for me
+            # lately". Banked-or-depleted relative to your norm is the signal.
+            off_reference = any(
+                d.key in reading
+                and abs(reading[d.key].level - reading[d.key].reference)
+                > DRIVE_BAND_MARGIN
                 for d in DRIVES
             )
-            if not (impulses or open_cur or off_baseline):
+            if not (impulses or open_cur or off_reference):
                 log.info("self-turn tick peer=%s skip=nothing-to-chew", peer)
                 return
 
-            messages = await self._build_messages(peer, impulses, open_cur, levels)
+            messages = await self._build_messages(peer, impulses, open_cur, reading)
             # The execute-and-loop runs Jeff's chosen inward verbs (or none). The
             # result is Jeff's own narration — not sent anywhere, just logged.
             result = await run_tool_loop(
@@ -198,7 +203,7 @@ class SelfTurnLoop:
             # Type-only (never the message — may carry model/peer-shaped text).
             log.error("self-turn failed peer=%s exc=%s", peer, type(e).__name__)
 
-    async def _build_messages(self, peer, impulses, open_cur, levels) -> list[dict]:
+    async def _build_messages(self, peer, impulses, open_cur, reading) -> list[dict]:
         """Assemble the self-turn context: base persona + the state blocks (mood,
         drives, impulses, curiosities) + the recent thread + the synthetic nudge.
         Each block fetch is best-effort — a read fault drops that block, never the
@@ -222,7 +227,10 @@ class SelfTurnLoop:
                     mood_description = active.description or ""
             except Exception as e:
                 log.error("self-turn mood fetch failed exc=%s", type(e).__name__)
-        drives = [(d.noun, levels.get(d.key, d.baseline), d.baseline) for d in DRIVES]
+        drives = [
+            (d.noun, *(reading.get(d.key) or DriveReading(d.baseline, d.baseline)))
+            for d in DRIVES
+        ]
         return await build_self_turn_messages(
             self._memory,
             peer,

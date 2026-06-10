@@ -227,10 +227,12 @@ def _render_mood(name: str, description: str) -> str:
     )
 
 
-# How far a drive must sit from its baseline before it's "notable" enough to
-# colour the prompt (and the /mind band). Symmetric around each drive's own
-# baseline. commands._drive_band keeps the same margin so the operator view and
-# what Jeff sees stay aligned.
+# How far a drive's level must sit from its rolling EMA **reference** (its
+# personal baseline) before it's "notable" enough to colour the prompt (and the
+# /mind band). Symmetric around each drive's own reference, NOT an absolute mark —
+# with uncapped, leak-to-zero levels there is no fixed band, so "high/low" means
+# "above/below your recent norm". commands._drive_band keeps the same margin so
+# the operator view and what Jeff sees stay aligned.
 DRIVE_BAND_MARGIN = 0.15
 
 
@@ -240,8 +242,8 @@ def _render_drives(
     """Render Jeff's current drive balance as a labelled block for the system
     message. Returns "" when there's nothing to show.
 
-    `states` is an ordered ``(noun, level, baseline)`` list — the decayed-to-now
-    level of each standing drive in ``[0, 1]`` plus the baseline it rests at (see
+    `states` is an ordered ``(noun, level, reference)`` list — the leaked-to-now
+    level of each standing drive plus its rolling EMA reference (see
     ``appraisal.DriveState``). This is Jeff's *own* continuous inner state (not
     peer text), so it isn't wrapped in <peer_message>, and like every inner-life
     block it's **additive**: it nudges how Jeff shows up but never overrides the
@@ -249,11 +251,12 @@ def _render_drives(
 
     Rendered as a short, natural-language self-state — NOT a list to recite back —
     so it colours tone rather than being narrated. Bands are judged **relative to
-    each drive's baseline** (`±DRIVE_BAND_MARGIN`): a drive sitting at its resting
-    baseline is unremarkable and goes unmentioned, "well-met" only when satiated
-    above it, "running low" only when depleted below it. This matters because not
-    every drive rests at the same baseline — connection rests low (0.2) on
-    purpose, so it should read "steady" at rest, not perpetually "low".
+    each drive's own reference** (`±DRIVE_BAND_MARGIN`): a drive sitting near its
+    recent norm is unremarkable and goes unmentioned, "well-met" only when banked
+    above it, "running low" only when depleted below it. The reference is each
+    drive's *personal* baseline (a slow EMA), so this reads "high/low for you,
+    lately" — there is no absolute ceiling anymore (levels are uncapped and leak
+    toward zero), which is exactly why the band has to be relative.
 
     Design note (kept here on purpose): this is deliberately distinct from the
     mood block. A mood is a discrete, time-boxed, Jeff-authored *episode* ("today
@@ -265,8 +268,8 @@ def _render_drives(
     """
     if not states:
         return ""
-    high = [noun for noun, level, base in states if level >= base + DRIVE_BAND_MARGIN]
-    low = [noun for noun, level, base in states if level <= base - DRIVE_BAND_MARGIN]
+    high = [noun for noun, level, ref in states if level >= ref + DRIVE_BAND_MARGIN]
+    low = [noun for noun, level, ref in states if level <= ref - DRIVE_BAND_MARGIN]
     if not high and not low:
         sentence = (
             "Right now your inner drives are all sitting in a comfortable middle — "
