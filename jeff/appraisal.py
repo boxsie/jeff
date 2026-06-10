@@ -166,6 +166,14 @@ _MAX_EXCHANGE_CHARS = 2000
 # line). 7 days.
 _EMA_HALF_LIFE_SECONDS = 7 * 24 * 3600.0
 
+# Payback window (seconds) for the earn-back P&L (slice b2): an open spend whose
+# drive isn't credited within this window is settled as a FLOP (net = −cost) —
+# the outcome never came back. A *real* payback (a crediting appraisal) settles
+# the spend the moment it lands, regardless of age, so this only bites genuinely
+# unanswered spends (e.g. a reach-out that drew a cold / no reply). Internal
+# smoothing, not an operator knob — one line to tune. 24 hours.
+_PAYBACK_WINDOW_SECONDS = 24 * 3600.0
+
 
 class DriveReading(NamedTuple):
     """A drive's current state as every consumer reads it: the fast leaking
@@ -178,12 +186,25 @@ class DriveReading(NamedTuple):
 
 class SpendRecord(NamedTuple):
     """One row of the spend ledger: which action debited which drive, by how much,
-    and when. ``spent_at`` is a timezone-aware datetime from Postgres."""
+    and when — plus the earn-back settlement (slice b2). ``spent_at`` is a
+    timezone-aware datetime from Postgres. ``credit`` is the outcome-attributed
+    payback once the spend has settled (``None`` while still pending — no payback
+    yet); ``settled_at`` is when it settled. ``net`` is ``credit − cost`` (the
+    P&L), or ``None`` while pending."""
 
     action: str
     drive: str
     amount: float
     spent_at: object
+    credit: float | None = None
+    settled_at: object | None = None
+
+    @property
+    def net(self) -> float | None:
+        """The action's profit/loss: ``credit − cost`` once settled, else None.
+        Positive = the action earned back more than it spent; negative = a loss
+        (it cost currency and the outcome didn't pay it back)."""
+        return None if self.credit is None else self.credit - self.amount
 
 
 def floor_at_zero(x: float) -> float:
@@ -268,7 +289,21 @@ _DDL_SPEND_TABLE = sql.SQL(
     "action TEXT NOT NULL, "
     "drive TEXT NOT NULL, "
     "amount DOUBLE PRECISION NOT NULL, "
-    "spent_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    "spent_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+    # Earn-back settlement (slice b2): NULL until the spend's outcome is
+    # appraised. credit = the attributed payback, settled_at = when it settled.
+    "credit DOUBLE PRECISION, "
+    "settled_at TIMESTAMPTZ)"
+)
+
+# Additive migration for an already-deployed drive_spend (pre-earn-back model):
+# both settlement columns are nullable — a row written before they existed reads
+# back as credit/settled_at = NULL (pending), so no backfill UPDATE is needed.
+_DDL_ADD_SPEND_CREDIT = sql.SQL(
+    "ALTER TABLE drive_spend ADD COLUMN IF NOT EXISTS credit DOUBLE PRECISION"
+)
+_DDL_ADD_SPEND_SETTLED = sql.SQL(
+    "ALTER TABLE drive_spend ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ"
 )
 
 _DDL_IDX_SPEND = sql.SQL(
@@ -277,7 +312,7 @@ _DDL_IDX_SPEND = sql.SQL(
 )
 
 _EXPECTED_SPEND_COLUMNS = frozenset(
-    {"id", "peer", "action", "drive", "amount", "spent_at"}
+    {"id", "peer", "action", "drive", "amount", "spent_at", "credit", "settled_at"}
 )
 
 
@@ -316,6 +351,8 @@ class DriveState:
                 await cur.execute(_DDL_ADD_EMA)
                 await cur.execute(_DDL_IDX_PEER)
                 await cur.execute(_DDL_SPEND_TABLE)
+                await cur.execute(_DDL_ADD_SPEND_CREDIT)
+                await cur.execute(_DDL_ADD_SPEND_SETTLED)
                 await cur.execute(_DDL_IDX_SPEND)
                 await assert_columns(cur, "drive_state", _EXPECTED_COLUMNS)
                 await assert_columns(cur, "drive_spend", _EXPECTED_SPEND_COLUMNS)
@@ -482,20 +519,93 @@ class DriveState:
             await conn.commit()
         return applied
 
+    async def settle_spends(
+        self,
+        peer: str,
+        credits: dict[str, float],
+        *,
+        window_seconds: float = _PAYBACK_WINDOW_SECONDS,
+    ) -> dict[str, float]:
+        """Reconcile the post-turn appraisal income against open spends — the P&L.
+
+        ``credits`` is the per-drive appraisal delta that was just applied to the
+        levels (the income). For every credited drive that has an *open*
+        (unsettled) spend, the OLDEST open spend on that drive is settled with
+        that credit (signed): a reach-out that landed (positive connection credit)
+        nets toward positive (``credit − cost``); one whose follow-up actively
+        drained connection (negative credit) nets further negative. This only
+        *records* the credit against the spend row — it does NOT re-apply it to
+        the level (``apply`` already did), so income is never double-counted: a
+        credit with no open spend is pure income, a credit with an open spend is
+        that action's earn-back. FIFO (oldest first) so successive appraisals
+        settle a backlog of spends in the order they happened.
+
+        Separately, any open spend older than ``window_seconds`` with no payback
+        yet is settled as a FLOP (credit 0 → net = −cost): the payback window
+        passed and nothing came back. Returns ``{drive: net}`` for the *credited*
+        settlements (for the log line); flop settlements show up via
+        ``recent_spends``. A no-op (no credited drives, nothing stale) writes
+        nothing.
+        """
+        wanted = {
+            k: float(v)
+            for k, v in credits.items()
+            if k in _BASELINES and float(v) != 0.0
+        }
+        settled: dict[str, float] = {}
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for drive, credit in wanted.items():
+                    # Settle the single oldest open spend on this drive. The
+                    # subselect picks it; RETURNING hands back its cost so we can
+                    # compute the net. No open spend ⇒ no row ⇒ pure income.
+                    await cur.execute(
+                        "UPDATE drive_spend SET credit = %s, settled_at = now() "
+                        "WHERE id = (SELECT id FROM drive_spend "
+                        "WHERE peer = %s AND drive = %s AND settled_at IS NULL "
+                        "ORDER BY spent_at ASC, id ASC LIMIT 1) "
+                        "RETURNING amount",
+                        (credit, peer, drive),
+                    )
+                    row = await cur.fetchone()
+                    if row is not None:
+                        settled[drive] = credit - float(row[0])
+                # Flop-expire anything that outlived its payback window unsettled.
+                await cur.execute(
+                    "UPDATE drive_spend SET credit = 0.0, settled_at = now() "
+                    "WHERE peer = %s AND settled_at IS NULL "
+                    "AND spent_at < now() - make_interval(secs => %s)",
+                    (peer, float(window_seconds)),
+                )
+            await conn.commit()
+        return settled
+
     async def recent_spends(self, peer: str, limit: int = 20) -> list[SpendRecord]:
         """The most recent spend-log rows for one peer (newest first), for the
-        /mind economy view and the earn-back P&L. Bounded by ``limit``."""
+        /mind economy view and the earn-back P&L. Each carries its settlement
+        (``credit``/``settled_at``/``net``) when reconciled, else None (pending).
+        Bounded by ``limit``."""
         out: list[SpendRecord] = []
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT action, drive, amount, spent_at FROM drive_spend "
-                    "WHERE peer = %s ORDER BY spent_at DESC, id DESC LIMIT %s",
+                    "SELECT action, drive, amount, spent_at, credit, settled_at "
+                    "FROM drive_spend WHERE peer = %s "
+                    "ORDER BY spent_at DESC, id DESC LIMIT %s",
                     (peer, max(1, int(limit))),
                 )
                 rows = await cur.fetchall()
-        for action, drive, amount, spent_at in rows:
-            out.append(SpendRecord(action, drive, float(amount), spent_at))
+        for action, drive, amount, spent_at, credit, settled_at in rows:
+            out.append(
+                SpendRecord(
+                    action,
+                    drive,
+                    float(amount),
+                    spent_at,
+                    None if credit is None else float(credit),
+                    settled_at,
+                )
+            )
         return out
 
     async def forget(self, peer: str) -> int:
@@ -646,11 +756,17 @@ class AppraisalDriver:
             log.info("appraisal pass peer=%s moved=none", peer)
             return
         applied = await self._store.apply(peer, deltas)
+        # Earn-back P&L (slice b2): attribute this income to any open spend that
+        # preceded it — the turn following a spend is that spend's outcome. Pure
+        # bookkeeping over the spend-log (no second apply to the level), so income
+        # isn't double-counted. Never raises into the pass (covered by _run).
+        settled = await self._store.settle_spends(peer, deltas)
         # Counts/keys only — never the exchange text (it's distilled from peer text).
         log.info(
-            "appraisal pass peer=%s moved=%s",
+            "appraisal pass peer=%s moved=%s settled=%s",
             peer,
             ",".join(f"{k}{applied[k]:+.2f}" for k in sorted(applied)) or "none",
+            ",".join(f"{k}(net{settled[k]:+.2f})" for k in sorted(settled)) or "none",
         )
 
 

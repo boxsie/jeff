@@ -239,6 +239,7 @@ class FakeStore:
     def __init__(self, levels: dict[str, float] | None = None):
         self._levels = levels or {d.key: d.baseline for d in DRIVES}
         self.applied: list[dict[str, float]] = []
+        self.settled: list[dict[str, float]] = []
 
     async def levels(self, peer):
         return dict(self._levels)
@@ -246,6 +247,10 @@ class FakeStore:
     async def apply(self, peer, deltas):
         self.applied.append(dict(deltas))
         return dict(deltas)
+
+    async def settle_spends(self, peer, credits):
+        self.settled.append(dict(credits))
+        return {}
 
 
 class FakeProvider:
@@ -267,6 +272,9 @@ async def test_appraise_applies_parsed_deltas():
     await driver._appraise("EpeerD", "tell me about quantum stuff", "here's the idea…")
 
     assert store.applied == [{"connection": 0.1, "novelty": -0.05}]
+    # The same income is handed to settle_spends as the earn-back signal (the
+    # P&L attribution), with no second apply to the level.
+    assert store.settled == [{"connection": 0.1, "novelty": -0.05}]
     # The provider saw the current levels + the exchange.
     user_block = provider.calls[0][1]["content"]
     assert "Latest exchange" in user_block
@@ -280,8 +288,10 @@ async def test_appraise_no_signal_writes_nothing():
 
     await driver._appraise("EpeerD", "ok", "ok")
 
-    # All-zero deltas parse to {} → apply is short-circuited (never called).
+    # All-zero deltas parse to {} → apply is short-circuited (never called), and
+    # with no income there's nothing to settle either.
     assert store.applied == []
+    assert store.settled == []
 
 
 @pytest.mark.asyncio
@@ -710,3 +720,119 @@ async def test_reset_wipes_spend_log(pool):
     await store.spend("EpeerD", "recall_memory", {"novelty": 0.1})
     await store.reset()
     assert await store.recent_spends("EpeerD") == []
+
+
+# --- earn-back / per-action P&L (slice b2) ---------------------------------
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_settle_lands_nets_positive(pool):
+    """A reach-out that lands: spent 0.15 connection, the next exchange's
+    appraisal credits 0.2 connection → settled net +0.05."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.3})
+    await store.spend("EpeerD", "reach_out", {"connection": 0.15})
+    settled = await store.settle_spends("EpeerD", {"connection": 0.2})
+    assert settled["connection"] == pytest.approx(0.05, abs=1e-9)
+    rec = (await store.recent_spends("EpeerD"))[0]
+    assert rec.credit == pytest.approx(0.2)
+    assert rec.net == pytest.approx(0.05, abs=1e-9)
+    assert rec.settled_at is not None
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_settle_negative_credit_nets_more_negative(pool):
+    """An exchange that actively drained the drive (negative credit) makes the
+    preceding spend a deeper loss: net = credit − cost = −0.1 − 0.15."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.3})
+    await store.spend("EpeerD", "reach_out", {"connection": 0.15})
+    settled = await store.settle_spends("EpeerD", {"connection": -0.1})
+    assert settled["connection"] == pytest.approx(-0.25, abs=1e-9)
+    assert (await store.recent_spends("EpeerD"))[0].net == pytest.approx(-0.25, abs=1e-9)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_settle_flop_after_window_nets_negative(pool):
+    """A flop: the spend outlives its payback window with no credit → settled
+    at credit 0, net = −cost. No income drive is needed to trigger expiry."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.3})
+    await store.spend("EpeerD", "reach_out", {"connection": 0.15})
+    # Age the spend row past the (tiny) window we pass below.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE drive_spend SET spent_at = now() - interval '25 hours' "
+                "WHERE peer = %s",
+                ("EpeerD",),
+            )
+        await conn.commit()
+    settled = await store.settle_spends("EpeerD", {})  # no income at all
+    assert settled == {}  # flops aren't returned, only credited settlements
+    rec = (await store.recent_spends("EpeerD"))[0]
+    assert rec.credit == 0.0
+    assert rec.net == pytest.approx(-0.15, abs=1e-9)
+    assert rec.settled_at is not None
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_settle_credit_with_no_open_spend_is_noop(pool):
+    """Income with no preceding spend is pure income — nothing to attribute, so
+    settle writes nothing (the double-count guard: never both)."""
+    store = await _store(pool)
+    settled = await store.settle_spends("EpeerD", {"novelty": 0.2})
+    assert settled == {}
+    assert await store.recent_spends("EpeerD") == []
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_settle_is_fifo_oldest_first(pool):
+    """Two spends on one drive, one credit: only the OLDEST open spend settles;
+    the newer one stays pending until the next crediting appraisal."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.6})
+    await store.spend("EpeerD", "reach_out", {"connection": 0.1})  # older
+    await store.spend("EpeerD", "reach_out", {"connection": 0.1})  # newer
+    await store.settle_spends("EpeerD", {"connection": 0.2})
+    spends = await store.recent_spends("EpeerD")  # newest first
+    assert spends[0].credit is None  # newer still pending
+    assert spends[1].credit == pytest.approx(0.2)  # older settled
+    # A second crediting appraisal settles the remaining one.
+    await store.settle_spends("EpeerD", {"connection": 0.05})
+    spends = await store.recent_spends("EpeerD")
+    assert spends[0].credit == pytest.approx(0.05)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_settle_does_not_resettle(pool):
+    """Once settled, a spend is closed: a later credit attributes to the next
+    open spend, never re-opens or overwrites an already-settled one."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.3})
+    await store.spend("EpeerD", "reach_out", {"connection": 0.15})
+    await store.settle_spends("EpeerD", {"connection": 0.2})
+    # No open spend left → this credit attributes to nothing, leaves the row be.
+    settled = await store.settle_spends("EpeerD", {"connection": 0.9})
+    assert settled == {}
+    assert (await store.recent_spends("EpeerD"))[0].credit == pytest.approx(0.2)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_pending_spend_reports_none_net(pool):
+    """Before any appraisal, a spend is pending: credit/settled_at/net all None
+    (a cost on the books with no realised payback yet) — what /mind shows."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"connection": 0.3})
+    await store.spend("EpeerD", "reach_out", {"connection": 0.15})
+    rec = (await store.recent_spends("EpeerD"))[0]
+    assert rec.credit is None
+    assert rec.settled_at is None
+    assert rec.net is None
