@@ -403,6 +403,7 @@ async def pool(pg_url):
         async with conn.cursor() as cur:
             await cur.execute("DROP TABLE IF EXISTS drive_state")
             await cur.execute("DROP TABLE IF EXISTS drive_spend")
+            await cur.execute("DROP TABLE IF EXISTS drive_income")
         await conn.commit()
     yield p
     await p.close()
@@ -836,3 +837,42 @@ async def test_pending_spend_reports_none_net(pool):
     assert rec.credit is None
     assert rec.settled_at is None
     assert rec.net is None
+
+
+# --- income ledger (slice b4) ----------------------------------------------
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_apply_logs_income(pool):
+    """Each appraisal delta apply() lands is logged as gross income (signed),
+    for the /mind economy view's 'what fed each drive lately' line."""
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.2, "connection": -0.1})
+    income = await store.recent_income("EpeerD")
+    by_drive = {r.drive: r.amount for r in income}
+    assert by_drive["novelty"] == pytest.approx(0.2)
+    assert by_drive["connection"] == pytest.approx(-0.1)  # a drain logs negative
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_recent_income_newest_first_and_bounded(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.1})
+    await store.apply("EpeerD", {"connection": 0.2})
+    income = await store.recent_income("EpeerD", limit=1)
+    assert len(income) == 1
+    assert income[0].drive == "connection"  # newest first
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_forget_and_reset_wipe_income(pool):
+    store = await _store(pool)
+    await store.apply("EpeerD", {"novelty": 0.2})
+    await store.forget("EpeerD")
+    assert await store.recent_income("EpeerD") == []
+    await store.apply("EpeerD", {"novelty": 0.2})
+    await store.reset()
+    assert await store.recent_income("EpeerD") == []

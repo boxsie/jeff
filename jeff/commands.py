@@ -415,6 +415,68 @@ def _drive_band(level: float, reference: float) -> str:
     return "steady"
 
 
+# How many recent income/spend events the `/mind` economy view summarises — a
+# legible window, not the whole append-only ledger (which grows per turn).
+_MIND_ECONOMY_LIMIT = 8
+
+
+def _spend_outcome(rec) -> str:
+    """Render a spend row's earn-back settlement for the `/mind` P&L line: still
+    pending (no payback yet), or settled with the credit earned and the net
+    (credit − cost). A flop reads as '+0.00 back, net −cost' — honest."""
+    if rec.credit is None:
+        return "pending"
+    return f"{rec.credit:+.2f} back, net {rec.net:+.2f}"
+
+
+async def _drives_section(ctx: CommandContext) -> str:
+    """The drives + economy block of `/mind`: per-drive balance/band/avg, the
+    recent feed and spend per drive, and a per-action P&L list. Read-only and
+    content-safe — only numbers, action names, and drive nouns (no peer text)."""
+    from .appraisal import DRIVES
+
+    reading = await ctx.drives.state(ctx.peer)
+    income = await ctx.drives.recent_income(ctx.peer, limit=_MIND_ECONOMY_LIMIT)
+    spends = await ctx.drives.recent_spends(ctx.peer, limit=_MIND_ECONOMY_LIMIT)
+    nouns = {d.key: d.noun for d in DRIVES}
+
+    # Aggregate the windowed flow per drive: gross fed (signed) and total spent.
+    fed: dict[str, float] = {}
+    for r in income:
+        fed[r.drive] = fed.get(r.drive, 0.0) + r.amount
+    spent: dict[str, float] = {}
+    for r in spends:
+        spent[r.drive] = spent.get(r.drive, 0.0) + r.amount
+
+    lines = ["drives:"]
+    # Each drive's leaked-to-now balance, its rolling reference (the personal
+    # baseline it's judged against), and a one-word band — plus the recent flow
+    # when there's been any, so the operator sees both the balance the appraisal
+    # is steering and what's been moving it. Uncapped, so a number can exceed 1.
+    for d in DRIVES:
+        r = reading[d.key]
+        line = (
+            f"  • {d.noun}: {r.level:.2f} "
+            f"({_drive_band(r.level, r.reference)}, avg {r.reference:.2f})"
+        )
+        if d.key in fed or d.key in spent:
+            line += f" — fed {fed.get(d.key, 0.0):+.2f}, spent {spent.get(d.key, 0.0):.2f}"
+        lines.append(line)
+
+    # Per-action P&L: what each recent spend cost and whether it earned back.
+    if spends:
+        lines.append(f"recent actions ({len(spends)}):")
+        lines.extend(
+            f"  • {r.action}: −{r.amount:.2f} {nouns.get(r.drive, r.drive)} "
+            f"→ {_spend_outcome(r)}"
+            for r in spends
+        )
+    else:
+        lines.append("recent actions: (nothing spent yet)")
+
+    return "\n".join(lines)
+
+
 async def _mood_line(ctx: CommandContext) -> str:
     """One-line description of the active mood (or neutral), shared by `/mood`
     and the `/mind` mood section. Computes 'time left' from the DB expiry against
@@ -596,22 +658,7 @@ async def _cmd_mind(ctx: CommandContext) -> str:
         sections.append("\n".join(lines))
 
     if ctx.drives is not None:
-        from .appraisal import DRIVES
-
-        reading = await ctx.drives.state(ctx.peer)
-        lines = ["drives:"]
-        # Show each drive's leaked-to-now balance, its rolling reference (the
-        # personal baseline it's judged against), and a one-word band — so the
-        # operator sees both the balance the appraisal pass is steering and where
-        # it sits relative to Jeff's recent norm (uncapped, so the number can
-        # exceed 1).
-        lines.extend(
-            f"  • {d.noun}: {reading[d.key].level:.2f} "
-            f"({_drive_band(reading[d.key].level, reading[d.key].reference)}, "
-            f"avg {reading[d.key].reference:.2f})"
-            for d in DRIVES
-        )
-        sections.append("\n".join(lines))
+        sections.append(await _drives_section(ctx))
 
     if ctx.impulses is not None:
         active = await ctx.impulses.list_active(ctx.peer)

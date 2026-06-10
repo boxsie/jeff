@@ -207,6 +207,18 @@ class SpendRecord(NamedTuple):
         return None if self.credit is None else self.credit - self.amount
 
 
+class IncomeRecord(NamedTuple):
+    """One row of the income ledger: how much an appraisal pass fed (or, if
+    negative, drained) a drive, and when. The *gross* appraisal feed — distinct
+    from a spend's ``credit`` (the subset attributed to a preceding action) — so
+    the /mind view can show "what fed each drive lately" on its own. ``fed_at`` is
+    a timezone-aware datetime from Postgres."""
+
+    drive: str
+    amount: float
+    fed_at: object
+
+
 def floor_at_zero(x: float) -> float:
     """Floor a level at 0. Drives are uncapped *above* (no ``1.0`` ceiling — that
     was the drivemaxxing attractor) but a balance can't go negative."""
@@ -315,6 +327,26 @@ _EXPECTED_SPEND_COLUMNS = frozenset(
     {"id", "peer", "action", "drive", "amount", "spent_at", "credit", "settled_at"}
 )
 
+# The income ledger (slice b4): an append-only log of the appraisal feed — every
+# per-drive delta apply() lands, positive (fed) or negative (drained). Symmetric
+# to drive_spend; lets the /mind economy view show "what fed each drive lately"
+# as its own line, separate from the earn-back credit attributed to a spend.
+_DDL_INCOME_TABLE = sql.SQL(
+    "CREATE TABLE IF NOT EXISTS drive_income ("
+    "id BIGSERIAL PRIMARY KEY, "
+    "peer TEXT NOT NULL, "
+    "drive TEXT NOT NULL, "
+    "amount DOUBLE PRECISION NOT NULL, "
+    "fed_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+)
+
+_DDL_IDX_INCOME = sql.SQL(
+    "CREATE INDEX IF NOT EXISTS idx_drive_income_peer_at "
+    "ON drive_income(peer, fed_at DESC)"
+)
+
+_EXPECTED_INCOME_COLUMNS = frozenset({"id", "peer", "drive", "amount", "fed_at"})
+
 
 class DriveState:
     """Async store of a peer's drive levels (plain Postgres, lazy read-time decay).
@@ -354,8 +386,11 @@ class DriveState:
                 await cur.execute(_DDL_ADD_SPEND_CREDIT)
                 await cur.execute(_DDL_ADD_SPEND_SETTLED)
                 await cur.execute(_DDL_IDX_SPEND)
+                await cur.execute(_DDL_INCOME_TABLE)
+                await cur.execute(_DDL_IDX_INCOME)
                 await assert_columns(cur, "drive_state", _EXPECTED_COLUMNS)
                 await assert_columns(cur, "drive_spend", _EXPECTED_SPEND_COLUMNS)
+                await assert_columns(cur, "drive_income", _EXPECTED_INCOME_COLUMNS)
             await conn.commit()
 
     async def state(self, peer: str) -> dict[str, DriveReading]:
@@ -454,6 +489,13 @@ class DriveState:
                         "SET level = EXCLUDED.level, ema = EXCLUDED.ema, "
                         "updated_at = now()",
                         (peer, drive, new_level, new_ema),
+                    )
+                    # Log the appraisal feed (the clamped delta, signed) so the
+                    # /mind economy view can show what fed each drive lately.
+                    await cur.execute(
+                        "INSERT INTO drive_income (peer, drive, amount) "
+                        "VALUES (%s, %s, %s)",
+                        (peer, drive, delta),
                     )
                     applied[drive] = new_level
             await conn.commit()
@@ -608,24 +650,42 @@ class DriveState:
             )
         return out
 
+    async def recent_income(self, peer: str, limit: int = 20) -> list[IncomeRecord]:
+        """The most recent income-ledger rows for one peer (newest first) — the
+        gross appraisal feed, for the /mind economy view. Bounded by ``limit``."""
+        out: list[IncomeRecord] = []
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT drive, amount, fed_at FROM drive_income "
+                    "WHERE peer = %s ORDER BY fed_at DESC, id DESC LIMIT %s",
+                    (peer, max(1, int(limit))),
+                )
+                rows = await cur.fetchall()
+        for drive, amount, fed_at in rows:
+            out.append(IncomeRecord(drive, float(amount), fed_at))
+        return out
+
     async def forget(self, peer: str) -> int:
-        """Delete every drive row AND spend-log row for one peer (so /forget wipes
-        the whole economy). Returns the number of drive_state rows removed."""
+        """Delete every drive row AND spend/income-log row for one peer (so
+        /forget wipes the whole economy). Returns the drive_state rows removed."""
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DELETE FROM drive_state WHERE peer = %s", (peer,))
                 deleted = cur.rowcount
                 await cur.execute("DELETE FROM drive_spend WHERE peer = %s", (peer,))
+                await cur.execute("DELETE FROM drive_income WHERE peer = %s", (peer,))
             await conn.commit()
         return int(deleted)
 
     async def reset(self) -> None:
-        """Destructive fresh start: drop both tables and recreate them (called by
-        ``reset-memory``; mirrors MoodStore.reset)."""
+        """Destructive fresh start: drop all economy tables and recreate them
+        (called by ``reset-memory``; mirrors MoodStore.reset)."""
         async with self._pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("DROP TABLE IF EXISTS drive_state")
                 await cur.execute("DROP TABLE IF EXISTS drive_spend")
+                await cur.execute("DROP TABLE IF EXISTS drive_income")
             await conn.commit()
         await self._init_schema()
 

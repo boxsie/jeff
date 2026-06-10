@@ -582,10 +582,12 @@ async def test_forget_yes_also_wipes_pinned_store():
 class FakeDriveStore:
     """In-memory stand-in for DriveState that records /forget + serves /mind."""
 
-    def __init__(self, levels=None, references=None):
+    def __init__(self, levels=None, references=None, income=None, spends=None):
         self._levels = levels or {"connection": 0.8, "novelty": 0.2,
                                   "competence": 0.5, "autonomy": 0.5}
         self._refs = references or {}
+        self._income = income or []  # list[IncomeRecord]
+        self._spends = spends or []  # list[SpendRecord]
         self.forgotten: list[str] = []
 
     async def state(self, peer):
@@ -595,6 +597,12 @@ class FakeDriveStore:
             k: DriveReading(v, self._refs.get(k, 0.0))
             for k, v in self._levels.items()
         }
+
+    async def recent_income(self, peer, limit=20):
+        return list(self._income[:limit])
+
+    async def recent_spends(self, peer, limit=20):
+        return list(self._spends[:limit])
 
     async def forget(self, peer):
         self.forgotten.append(peer)
@@ -624,6 +632,34 @@ async def test_mind_shows_drive_balance_with_bands():
     assert "connection: 0.80 (well-met, avg 0.40)" in reply
     assert "novelty: 0.20 (running low, avg 0.50)" in reply
     assert "competence: 0.50 (steady, avg 0.50)" in reply
+    # No economy activity yet → the actions line reads empty, no flow suffixes.
+    assert "recent actions: (nothing spent yet)" in reply
+    assert "fed" not in reply
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_economy_flow_and_pnl():
+    # Income feeds + a settled spend (net +0.05), a pending spend, and a flop
+    # (credit 0 → net −cost). The view shows per-drive fed/spent and a P&L list.
+    from jeff.appraisal import IncomeRecord, SpendRecord
+
+    store = FakeDriveStore(
+        income=[IncomeRecord("connection", 0.2, None),
+                IncomeRecord("novelty", 0.1, None)],
+        spends=[
+            SpendRecord("reach_out", "connection", 0.15, None, 0.2, None),  # net +0.05
+            SpendRecord("set_mood", "autonomy", 0.05, None, None, None),    # pending
+            SpendRecord("recall_memory", "novelty", 0.03, None, 0.0, None),  # flop
+        ],
+    )
+    reg = build_command_registry(appraisal_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(drives=store))
+    # Per-drive flow suffix (gross fed signed, total spent).
+    assert "fed +0.20, spent 0.15" in reply  # connection
+    # Per-action P&L lines: settled / pending / flop.
+    assert "reach_out: −0.15 connection → +0.20 back, net +0.05" in reply
+    assert "set_mood: −0.05 self-expression → pending" in reply
+    assert "recall_memory: −0.03 novelty → +0.00 back, net -0.03" in reply
 
 
 @pytest.mark.asyncio
