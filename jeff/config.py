@@ -229,6 +229,10 @@ class Config:
     proactive_min_gap_s: float
     proactive_presence_ttl_s: float
 
+    self_turn_enabled: bool
+    self_turn_interval_s: float
+    self_turn_min_gap_s: float
+
     signal_enabled: bool
     signal_api_url: str
     signal_number: str
@@ -422,6 +426,15 @@ class Config:
             proactive_presence_ttl_s=float(
                 e.get("JEFF_PROACTIVE_PRESENCE_TTL_S", "3600")
             ),
+            # Idle self-turn (default off): an inward, tool-enabled "what do I want
+            # to do?" turn on a cadence, fired even when the operator is offline so
+            # Jeff drifts between sessions. interval paces *checking*; the loop
+            # still gates on a min-gap fuse and on there being something to act on
+            # (active impulse / open curiosity / off-baseline drive). Inward-only —
+            # no outbound message — until the reach_out slice lands. See selfturn.py.
+            self_turn_enabled=_parse_bool(e.get("JEFF_SELF_TURN_ENABLED", "false")),
+            self_turn_interval_s=float(e.get("JEFF_SELF_TURN_INTERVAL_S", "900")),
+            self_turn_min_gap_s=float(e.get("JEFF_SELF_TURN_MIN_GAP_S", "3600")),
             # Signal front door (default off): when off the client/loop are never
             # built, so behaviour is byte-identical. signal_number is Jeff's own
             # registered Signal number; signal_allowlist is the operator-number

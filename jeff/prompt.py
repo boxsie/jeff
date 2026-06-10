@@ -483,3 +483,55 @@ async def build_history(
         {"role": "user", "content": f"<peer_message>{user_text}</peer_message>"}
     )
     return history
+
+
+async def build_self_turn_messages(
+    memory: Memory,
+    peer: str,
+    instruction: str,
+    *,
+    recent_turns: int,
+    system_prompt: str = SYSTEM_PROMPT,
+    curiosities: Sequence[str] = (),
+    facts: Sequence[str] = (),
+    opinions: Sequence[str] = (),
+    mood_name: str = "",
+    mood_description: str = "",
+    pinned: Sequence[str] = (),
+    drives: Sequence[tuple[str, float, float]] = (),
+    drives_max_chars: int = 2000,
+    impulses: Sequence[tuple[str, str]] = (),
+    impulses_max_chars: int = 2000,
+) -> list[dict]:
+    """Assemble the messages list for an idle self-turn (no inbound peer text).
+
+    Same shape as `build_history` — system message carrying the state blocks
+    (persona / pinned / mood / drives / impulses / curiosities), then the recent
+    thread as real chat turns — EXCEPT the final message is Jeff's own self-turn
+    `instruction`, deliberately NOT wrapped in <peer_message>. The wrapping in
+    `build_history` exists to mark untrusted peer input the model must not obey;
+    the self-turn instruction is Jeff's own synthetic nudge — the very thing we
+    want it to act on — so wrapping it would defeat the turn. There's no recall
+    seed here (no query); the self-turn reaches into memory through the
+    `recall_memory` / `summarize_recent` tools instead.
+    """
+    recent = await memory.recent(peer, n=recent_turns)
+    extra = [
+        b
+        for b in (
+            _render_persona(facts, opinions),
+            _render_pinned(pinned),
+            _render_mood(mood_name, mood_description),
+            _render_drives(drives, max_chars=drives_max_chars),
+            _render_impulses(impulses, max_chars=impulses_max_chars),
+            _render_curiosities(curiosities),
+        )
+        if b
+    ]
+    system_content = (
+        system_prompt.rstrip() + "\n\n" + "\n\n".join(extra) if extra else system_prompt
+    )
+    history: list[dict] = [{"role": "system", "content": system_content}]
+    history.extend(_to_chat(recent))
+    history.append({"role": "user", "content": instruction})
+    return history

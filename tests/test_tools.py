@@ -243,3 +243,59 @@ def test_build_registry_adds_search_tools_when_enabled():
 def test_build_registry_omits_search_when_disabled():
     reg = build_registry(_cfg(), searxng=object())
     assert "web_search" not in reg.names()
+
+
+def test_build_registry_adds_memory_tools_when_memory_supplied():
+    # Sentinels are enough — build only stores the references.
+    reg = build_registry(
+        _cfg(JEFF_TOOLS_ENABLED="true"),
+        memory=object(),
+        chat_provider=object(),
+    )
+    assert "recall_memory" in reg.names()
+    assert "summarize_recent" in reg.names()
+
+
+def test_build_registry_omits_summarize_without_provider():
+    reg = build_registry(_cfg(JEFF_TOOLS_ENABLED="true"), memory=object())
+    assert "recall_memory" in reg.names()  # recall needs only memory
+    assert "summarize_recent" not in reg.names()  # summarize needs the provider
+
+
+def test_build_self_turn_registry_has_inward_and_memory_tools():
+    from jeff.tools import build_self_turn_registry
+
+    reg = build_self_turn_registry(
+        _cfg(
+            JEFF_SELF_TURN_ENABLED="true",
+            JEFF_MOOD_ENABLED="true",
+            JEFF_REMEMBER_ENABLED="true",
+            JEFF_IMPULSES_ENABLED="true",
+        ),
+        memory=object(),
+        chat_provider=object(),
+        mood_store=object(),
+        pinned_store=object(),
+        impulse_store=object(),
+    )
+    names = reg.names()
+    assert "set_mood" in names
+    assert "set_impulse" in names
+    assert "remember" in names
+    assert "recall_memory" in names
+    assert "summarize_recent" in names
+    # Inward-only: no search, no get_time, no outbound message tool.
+    assert "web_search" not in names
+    assert "get_time" not in names
+
+
+def test_build_self_turn_registry_empty_when_disabled():
+    from jeff.tools import build_self_turn_registry
+
+    reg = build_self_turn_registry(
+        _cfg(JEFF_SELF_TURN_ENABLED="false", JEFF_MOOD_ENABLED="true"),
+        memory=object(),
+        chat_provider=object(),
+        mood_store=object(),
+    )
+    assert len(reg) == 0

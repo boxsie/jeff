@@ -15,7 +15,7 @@ from .config import Config
 from .curiosity import CuriosityDriver, CuriosityStore
 from .dispatch import DispatchPolicy, TurnDispatcher
 from .impulses import ImpulseStore
-from .llm import ChatProvider, ChatResult
+from .llm import ChatProvider
 from .llm import make_chat_provider
 from .memory import Memory
 from .mood import MoodStore
@@ -26,10 +26,12 @@ from .proactive import ProactiveLoop, ProactiveStore
 from .prompt import build_history, compose_system_prompt
 from .reflection import Reflector, ReflectionStore
 from .screen import screen_text
+from .selfturn import SelfTurnLoop
 from .searxng import SearxngClient
 from .signal_cli import SignalCliClient
 from .signal_front import SignalHandle, run_signal_front
-from .tools import ToolRegistry, build_registry
+from .tools import ToolRegistry, build_registry, build_self_turn_registry
+from .turnloop import run_tool_loop
 
 
 log = logging.getLogger("jeff")
@@ -37,11 +39,6 @@ log = logging.getLogger("jeff")
 # Sent to the peer when the tool loop hits its iteration cap without the model
 # producing a final answer. No exception/internal text — same discipline as the
 # silent-failure path (pairs with ticket 2b5e93f8).
-_TOOL_CAP_MESSAGE = (
-    "Sorry — I couldn't finish working through that within my tool-use limit. "
-    "Could you try rephrasing or narrowing the request?"
-)
-
 # Sent to the peer when a turn raises (provider timeout, DB fault, …) so Jeff
 # reports the glitch in-character instead of going silent. Deliberately generic:
 # the exception string may embed an Ollama response body shaped by peer prompts
@@ -103,7 +100,7 @@ async def handle_turn(
     chat turn.
 
     When `registry` has tools and tools are enabled, the reply is produced by
-    the execute-and-loop (`_run_tool_loop`); otherwise the single-shot
+    the execute-and-loop (`turnloop.run_tool_loop`); otherwise the single-shot
     `chat()` path runs, byte-identical to the pre-tool behaviour. Either way
     only the *final* assistant text is stored in memory and sent — intermediate
     tool calls/results are working state, not conversational turns, so they
@@ -217,7 +214,7 @@ async def handle_turn(
         # still recorded even if the chat/tool call fails (matches prior behaviour).
         await memory.remember(peer, "user", text)
         if registry is not None and cfg.tools_enabled and len(registry):
-            reply = await _run_tool_loop(chat_provider, registry, history, cfg, peer)
+            reply = await run_tool_loop(chat_provider, registry, history, cfg, peer)
         else:
             reply = await chat_provider.chat(history, model=cfg.chat_model)
         await handle.send_message(peer, reply)
@@ -253,62 +250,6 @@ async def handle_turn(
             await handle.send_message(peer, _TURN_FAILED_MESSAGE)
         except Exception:
             log.exception("failed to send turn-failure reply to peer=%s", peer)
-
-
-def _assistant_tool_message(result: ChatResult) -> dict:
-    """Render a tool-calling assistant turn back into OpenAI-canonical form.
-
-    This is the message the model must see echoed before its tool results, so
-    it can correlate each `tool_call_id`. Content is preserved if the model
-    narrated alongside the calls.
-    """
-    return {
-        "role": "assistant",
-        "content": result.content or "",
-        "tool_calls": [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.name, "arguments": tc.arguments},
-            }
-            for tc in result.tool_calls
-        ],
-    }
-
-
-async def _run_tool_loop(
-    chat_provider: ChatProvider,
-    registry: ToolRegistry,
-    history: list[dict],
-    cfg: Config,
-    peer: str,
-) -> str:
-    """Call the provider, execute any tool calls, repeat until a final answer.
-
-    Bounded by `cfg.max_tool_iters`. Each tool result is fed back as a
-    `role:"tool"` message; the registry guarantees a safe string even for
-    unknown tools / bad args / raises / timeouts, so the loop never crashes on
-    a tool fault. Returns the model's final content, or a graceful cap message
-    if it never stops calling tools.
-
-    `peer` is the current turn's address; it's passed to `dispatch` so
-    peer-scoped tools (e.g. the mood tools) write to the right peer's state.
-    """
-    specs = registry.specs()
-    messages = list(history)
-    for _ in range(cfg.max_tool_iters):
-        result = await chat_provider.complete(messages, model=cfg.chat_model, tools=specs)
-        if not result.tool_calls:
-            return result.content or ""
-        log.info("tool turn: calls=%s", ",".join(tc.name for tc in result.tool_calls))
-        messages.append(_assistant_tool_message(result))
-        for tc in result.tool_calls:
-            out = await registry.dispatch(
-                tc.name, tc.arguments, peer=peer, timeout=cfg.tool_timeout_s
-            )
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
-    log.warning("tool loop hit iteration cap (%d)", cfg.max_tool_iters)
-    return _TOOL_CAP_MESSAGE
 
 
 def _policy_from_config(cfg: Config) -> DispatchPolicy:
@@ -554,6 +495,8 @@ async def run(cfg: Config) -> None:
             registry = build_registry(
                 cfg,
                 searxng=searxng,
+                memory=memory,
+                chat_provider=chat_provider,
                 mood_store=mood_store,
                 pinned_store=pinned_store,
                 impulse_store=impulse_store,
@@ -726,6 +669,50 @@ async def run(cfg: Config) -> None:
                             proactive_loop.run(), name="jeff-proactive"
                         )
 
+                    # Idle self-turn (default off) — the inward agency loop: hands
+                    # Jeff a tool-enabled "what do I want to do?" turn on a cadence,
+                    # fired even when the operator is offline. Inward verbs only
+                    # (mood/impulse/remember + memory scan); no outbound message in
+                    # this slice. The inward registry is empty (→ loop inert) unless
+                    # self_turn is on AND at least one inward feature is enabled.
+                    self_turn_task: asyncio.Task | None = None
+                    if cfg.self_turn_enabled:
+                        self_turn_registry = build_self_turn_registry(
+                            cfg,
+                            memory=memory,
+                            chat_provider=chat_provider,
+                            mood_store=mood_store,
+                            pinned_store=pinned_store,
+                            impulse_store=impulse_store,
+                        )
+                        if len(self_turn_registry) == 0:
+                            log.warning(
+                                "self-turn enabled but no inward verbs available "
+                                "(mood/remember/impulses all off) — loop will be inert"
+                            )
+                        else:
+                            log.info(
+                                "self-turn enabled: %s",
+                                ", ".join(self_turn_registry.names()),
+                            )
+                        self_turn_loop = SelfTurnLoop(
+                            memory,
+                            self_turn_registry,
+                            chat_provider,
+                            curiosity_store=curiosity_store,
+                            reflection_store=reflection_store,
+                            mood_store=mood_store,
+                            drive_store=drive_store,
+                            impulse_store=impulse_store,
+                            cfg=cfg,
+                            allowlist=cfg.allowlist,
+                        )
+                        self_turn_task = asyncio.create_task(
+                            self_turn_loop.run(), name="jeff-self-turn"
+                        )
+                    else:
+                        log.info("self-turn disabled")
+
                     events_task = asyncio.create_task(
                         _drain_events(
                             handle,
@@ -752,6 +739,8 @@ async def run(cfg: Config) -> None:
                         wait_set.add(signal_task)
                     if proactive_task is not None:
                         wait_set.add(proactive_task)
+                    if self_turn_task is not None:
+                        wait_set.add(self_turn_task)
                     done, pending = await asyncio.wait(
                         wait_set,
                         return_when=asyncio.FIRST_COMPLETED,
