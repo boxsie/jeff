@@ -164,11 +164,11 @@ async def handle_turn(
         # fault must never break the reply, so fall back to no block. Levels are
         # decayed-to-now in the store; here we just pair each drive's prose noun
         # with its current level for the renderer.
-        drives: list[tuple[str, float]] = []
+        drives: list[tuple[str, float, float]] = []
         if drive_store is not None:
             try:
                 levels = await drive_store.levels(peer)
-                drives = [(d.noun, levels[d.key]) for d in DRIVES]
+                drives = [(d.noun, levels[d.key], d.baseline) for d in DRIVES]
             except Exception as e:
                 log.error("drives fetch failed peer=%s exc=%s", peer, type(e).__name__)
 

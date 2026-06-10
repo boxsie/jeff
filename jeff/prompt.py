@@ -213,20 +213,33 @@ def _render_mood(name: str, description: str) -> str:
     )
 
 
-def _render_drives(states: Sequence[tuple[str, float]], *, max_chars: int = 2000) -> str:
+# How far a drive must sit from its baseline before it's "notable" enough to
+# colour the prompt (and the /mind band). Symmetric around each drive's own
+# baseline. commands._drive_band keeps the same margin so the operator view and
+# what Jeff sees stay aligned.
+DRIVE_BAND_MARGIN = 0.15
+
+
+def _render_drives(
+    states: Sequence[tuple[str, float, float]], *, max_chars: int = 2000
+) -> str:
     """Render Jeff's current drive balance as a labelled block for the system
     message. Returns "" when there's nothing to show.
 
-    `states` is an ordered ``(noun, level)`` list — the decayed-to-now level of
-    each standing drive in ``[0, 1]`` (see ``appraisal.DriveState``). This is
-    Jeff's *own* continuous inner state (not peer text), so it isn't wrapped in
-    <peer_message>, and like every inner-life block it's **additive**: it nudges
-    how Jeff shows up but never overrides the operator-owned base prompt.
+    `states` is an ordered ``(noun, level, baseline)`` list — the decayed-to-now
+    level of each standing drive in ``[0, 1]`` plus the baseline it rests at (see
+    ``appraisal.DriveState``). This is Jeff's *own* continuous inner state (not
+    peer text), so it isn't wrapped in <peer_message>, and like every inner-life
+    block it's **additive**: it nudges how Jeff shows up but never overrides the
+    operator-owned base prompt.
 
     Rendered as a short, natural-language self-state — NOT a list to recite back —
-    so it colours tone rather than being narrated. Bands: a level is "well-met"
-    near the top, "running low" near the bottom, and unremarkable in the middle;
-    only the notable ends are mentioned so the line stays a nudge, not a readout.
+    so it colours tone rather than being narrated. Bands are judged **relative to
+    each drive's baseline** (`±DRIVE_BAND_MARGIN`): a drive sitting at its resting
+    baseline is unremarkable and goes unmentioned, "well-met" only when satiated
+    above it, "running low" only when depleted below it. This matters because not
+    every drive rests at the same baseline — connection rests low (0.2) on
+    purpose, so it should read "steady" at rest, not perpetually "low".
 
     Design note (kept here on purpose): this is deliberately distinct from the
     mood block. A mood is a discrete, time-boxed, Jeff-authored *episode* ("today
@@ -238,8 +251,8 @@ def _render_drives(states: Sequence[tuple[str, float]], *, max_chars: int = 2000
     """
     if not states:
         return ""
-    high = [noun for noun, level in states if level >= 0.62]
-    low = [noun for noun, level in states if level <= 0.38]
+    high = [noun for noun, level, base in states if level >= base + DRIVE_BAND_MARGIN]
+    low = [noun for noun, level, base in states if level <= base - DRIVE_BAND_MARGIN]
     if not high and not low:
         sentence = (
             "Right now your inner drives are all sitting in a comfortable middle — "
@@ -332,7 +345,7 @@ async def build_history(
     mood_name: str = "",
     mood_description: str = "",
     pinned: Sequence[str] = (),
-    drives: Sequence[tuple[str, float]] = (),
+    drives: Sequence[tuple[str, float, float]] = (),
     drives_max_chars: int = 2000,
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
@@ -344,7 +357,7 @@ async def build_history(
     are Jeff's distilled persona (reflection slice); `mood_name`/`mood_description`
     are Jeff's current affective state (mood slice); `pinned` are deliberately-kept
     memories (remember slice); `drives` are the current decayed drive levels as
-    `(noun, level)` pairs (appraisal slice). When non-empty they ride in the system
+    `(noun, level, baseline)` triples (appraisal slice). When non-empty they ride in the system
     message as labelled blocks, in this order: persona (standing character), pinned
     (deliberate keeps), mood (transient episode), drives (continuous inner state,
     sat next to mood), recalled memories, then open curiosities. All empty (the

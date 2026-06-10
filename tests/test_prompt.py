@@ -203,7 +203,7 @@ async def test_build_history_injects_drives_block_when_present():
         user_text="hi",
         recent_turns=10,
         recall_k=5,
-        drives=[("connection", 0.8), ("novelty", 0.2), ("competence", 0.5)],
+        drives=[("connection", 0.8, 0.2), ("novelty", 0.2, 0.5), ("competence", 0.5, 0.5)],
     )
     sys_msg = history[0]
     assert sys_msg["role"] == "system"

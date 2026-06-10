@@ -89,6 +89,18 @@ def test_decay_clamps_result_into_range():
     assert decay_toward_baseline(1.0, 2.0, _HALF_LIFE_SECONDS, _HALF_LIFE_SECONDS) == 1.0
 
 
+def test_connection_rests_low_and_decays_fast():
+    # The proactivity tune: connection rests at a LOW baseline so silence depletes
+    # it into a reach-out deficit, and has a SHORTER half-life than the rest.
+    conn = next(d for d in DRIVES if d.key == "connection")
+    assert conn.baseline == 0.2
+    # Per-drive half-life override beats the store's global default; other drives
+    # fall back to it (None override).
+    store = DriveState(None, half_life_hours=24.0)  # type: ignore[arg-type]
+    assert store._half_life_for("connection") == 6.0 * 3600.0
+    assert store._half_life_for("novelty") == 24.0 * 3600.0
+
+
 # --- pure tests: appraisal parsing ------------------------------------------
 
 
@@ -142,7 +154,8 @@ def test_render_drives_empty_is_blank():
 
 
 def test_render_drives_all_middle_says_comfortable():
-    states = [("connection", 0.5), ("novelty", 0.5), ("competence", 0.5)]
+    # Each drive sitting AT its baseline reads as nothing-notable.
+    states = [("connection", 0.5, 0.5), ("novelty", 0.5, 0.5), ("competence", 0.5, 0.5)]
     block = _render_drives(states)
     assert "## Your drives right now" in block
     assert "comfortable middle" in block
@@ -150,10 +163,10 @@ def test_render_drives_all_middle_says_comfortable():
 
 def test_render_drives_flags_high_and_low():
     states = [
-        ("connection", 0.8),
-        ("novelty", 0.2),
-        ("competence", 0.5),
-        ("self-expression", 0.9),
+        ("connection", 0.8, 0.5),
+        ("novelty", 0.2, 0.5),
+        ("competence", 0.5, 0.5),
+        ("self-expression", 0.9, 0.5),
     ]
     block = _render_drives(states)
     # Highs are "well-met", lows are "running a little low"; mid is unmentioned.
@@ -162,8 +175,21 @@ def test_render_drives_flags_high_and_low():
     assert "competence" not in block
 
 
+def test_render_drives_bands_relative_to_baseline():
+    # A drive resting AT a low baseline (connection rests at 0.2) is unremarkable,
+    # NOT "running low" — bands are judged relative to each drive's own baseline.
+    at_rest = _render_drives([("connection", 0.2, 0.2)])
+    assert "comfortable middle" in at_rest
+    assert "connection" not in at_rest
+    # Bumped above its low baseline → well-met; depleted below it → running low.
+    assert "well-met on connection" in _render_drives([("connection", 0.5, 0.2)])
+    assert "running a little low on connection" in _render_drives(
+        [("connection", 0.02, 0.2)]
+    )
+
+
 def test_render_drives_respects_max_chars():
-    states = [("connection", 0.9)]
+    states = [("connection", 0.9, 0.2)]
     assert len(_render_drives(states, max_chars=20)) == 20
 
 
@@ -344,19 +370,23 @@ async def test_levels_default_to_baseline(pool):
     store = await _store(pool)
     levels = await store.levels("EpeerD")
     assert set(levels) == {d.key for d in DRIVES}
-    assert all(v == 0.5 for v in levels.values())
+    # Each never-appraised drive reads back at ITS OWN baseline (connection rests
+    # low at 0.2, the rest at 0.5).
+    assert all(levels[d.key] == d.baseline for d in DRIVES)
 
 
 @pytestmark_db
 @pytest.mark.asyncio
 async def test_apply_adds_delta_from_baseline(pool):
     store = await _store(pool)
-    applied = await store.apply("EpeerD", {"connection": 0.2, "novelty": -0.1})
-    assert applied["connection"] == pytest.approx(0.7)
+    # Use 0.5-baseline drives so this exercises generic add-from-baseline mechanics
+    # (connection's low baseline is covered by its own test below).
+    applied = await store.apply("EpeerD", {"competence": 0.2, "novelty": -0.1})
+    assert applied["competence"] == pytest.approx(0.7)
     assert applied["novelty"] == pytest.approx(0.4)
     levels = await store.levels("EpeerD")
-    assert levels["connection"] == pytest.approx(0.7, abs=1e-3)
-    assert levels["competence"] == 0.5  # untouched → baseline
+    assert levels["competence"] == pytest.approx(0.7, abs=1e-3)
+    assert levels["autonomy"] == 0.5  # untouched → baseline
 
 
 @pytestmark_db
@@ -383,19 +413,20 @@ async def test_levels_decays_aged_row_toward_baseline(pool):
     """A row last updated one half-life ago reads back halfway to baseline — the
     DB clock drives elapsed, the Python curve does the rest (deterministic)."""
     store = await _store(pool, half_life_hours=24.0)
-    await store.apply("EpeerD", {"connection": 0.3})  # 0.5 → 0.8
+    await store.apply("EpeerD", {"novelty": 0.3})  # 0.5 → 0.8
     # Age the row by exactly one half-life via SQL so elapsed is deterministic.
+    # novelty rests at 0.5 with the store's global 24h half-life (no override).
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 "UPDATE drive_state SET updated_at = now() - interval '24 hours' "
                 "WHERE peer = %s AND drive = %s",
-                ("EpeerD", "connection"),
+                ("EpeerD", "novelty"),
             )
         await conn.commit()
     levels = await store.levels("EpeerD")
     # 0.8 decayed one half-life toward 0.5 → 0.5 + 0.3*0.5 = 0.65.
-    assert levels["connection"] == pytest.approx(0.65, abs=1e-3)
+    assert levels["novelty"] == pytest.approx(0.65, abs=1e-3)
 
 
 @pytestmark_db
@@ -422,23 +453,45 @@ async def test_apply_decays_before_adding_delta(pool):
 @pytest.mark.asyncio
 async def test_forget_wipes_one_peer(pool):
     store = await _store(pool)
-    await store.apply("EpeerD", {"connection": 0.2, "novelty": 0.1})
-    await store.apply("EotherD", {"connection": 0.2})
+    await store.apply("EpeerD", {"novelty": 0.2, "competence": 0.1})
+    await store.apply("EotherD", {"novelty": 0.2})
 
     deleted = await store.forget("EpeerD")
     assert deleted == 2  # two drive rows for EpeerD
     # EpeerD reads back at baseline (no rows); EotherD untouched.
-    assert (await store.levels("EpeerD"))["connection"] == 0.5
-    assert (await store.levels("EotherD"))["connection"] == pytest.approx(0.7, abs=1e-3)
+    assert (await store.levels("EpeerD"))["novelty"] == 0.5
+    assert (await store.levels("EotherD"))["novelty"] == pytest.approx(0.7, abs=1e-3)
 
 
 @pytestmark_db
 @pytest.mark.asyncio
 async def test_reset_wipes_and_recreates(pool):
     store = await _store(pool)
-    await store.apply("EpeerD", {"connection": 0.2})
+    await store.apply("EpeerD", {"novelty": 0.2})
     await store.reset()
-    assert (await store.levels("EpeerD"))["connection"] == 0.5
+    assert (await store.levels("EpeerD"))["novelty"] == 0.5
     # Usable after reset.
-    applied = await store.apply("EpeerD", {"connection": 0.1})
-    assert applied["connection"] == pytest.approx(0.6)
+    applied = await store.apply("EpeerD", {"novelty": 0.1})
+    assert applied["novelty"] == pytest.approx(0.6)
+
+
+@pytestmark_db
+@pytest.mark.asyncio
+async def test_connection_decays_toward_low_baseline_on_its_own_half_life(pool):
+    """End-to-end: connection rests at 0.2 and uses its 6h half-life override, so a
+    bumped-up connection relaxes back DOWN toward 0.2 (the reach-out deficit) — even
+    though the store's global half-life is 24h."""
+    store = await _store(pool, half_life_hours=24.0)
+    await store.apply("EpeerD", {"connection": 0.3})  # 0.2 → 0.5
+    # Age by exactly one connection half-life (6h), not the store's 24h.
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE drive_state SET updated_at = now() - interval '6 hours' "
+                "WHERE peer = %s AND drive = %s",
+                ("EpeerD", "connection"),
+            )
+        await conn.commit()
+    levels = await store.levels("EpeerD")
+    # 0.5 decayed one (6h) half-life toward 0.2 → 0.2 + 0.3*0.5 = 0.35.
+    assert levels["connection"] == pytest.approx(0.35, abs=1e-3)

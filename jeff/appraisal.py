@@ -63,25 +63,35 @@ log = logging.getLogger("jeff.appraisal")
 @dataclass(frozen=True)
 class Drive:
     """One standing drive: its storage key, the short noun used in the prompt
-    block's prose, the baseline it decays toward, and the definition fed to the
-    appraisal pass so the model knows what satiates it."""
+    block's prose, the baseline it decays toward, the definition fed to the
+    appraisal pass so the model knows what satiates it, and an optional per-drive
+    decay half-life (hours) overriding the global default."""
 
     key: str
     noun: str
     baseline: float
     definition: str
+    half_life_hours: float | None = None
 
 
 # The drive set — a constant registry next to the feature so adding/removing a
 # drive is one line, never a schema change (the table keys on a free-text
-# `drive` column). Four drives, from the spitball. All baseline 0.5: the resting
-# state is "comfortable middle", and both satiation and depletion pull away from
-# it. Keep this small and meaningful — these are needs, not metrics.
+# `drive` column). Four drives, from the spitball. Most rest at a "comfortable
+# middle" baseline 0.5 with both satiation and depletion pulling away from it.
+# `connection` is the exception: it rests LOW (0.2) and decays fast (6h half-life)
+# so a stretch of silence genuinely depletes it — that deficit is the honest "I
+# miss the conversation" signal the proactive loop reads to decide whether to
+# reach out. Keep this small and meaningful — these are needs, not metrics.
 DRIVES: tuple[Drive, ...] = (
     Drive(
         key="connection",
         noun="connection",
-        baseline=0.5,
+        # Rests low and decays fast: silence should deplete connection into a
+        # real deficit (the proactive loop's reach-out pressure), while a warm
+        # exchange still bumps it up. Other drives keep the neutral 0.5 / global
+        # half-life — only connection drives unprompted contact.
+        baseline=0.2,
+        half_life_hours=6.0,
         definition=(
             "warm, present, back-and-forth turns where you and they genuinely "
             "met — not one-word service exchanges"
@@ -118,6 +128,13 @@ DRIVES: tuple[Drive, ...] = (
 
 _DRIVE_KEYS: tuple[str, ...] = tuple(d.key for d in DRIVES)
 _BASELINES: dict[str, float] = {d.key: d.baseline for d in DRIVES}
+# Per-drive half-life overrides in SECONDS (None ⇒ use the store's global
+# half-life). Lets one drive (connection) decay faster than the rest without a
+# config knob — adding an override is one line in the registry above.
+_HALF_LIFE_OVERRIDES: dict[str, float | None] = {
+    d.key: (d.half_life_hours * 3600.0 if d.half_life_hours is not None else None)
+    for d in DRIVES
+}
 
 # Hard bound on a single turn's per-drive delta. Drives move *gradually*: one
 # exchange can't spike (or crater) a drive, so the level reflects a trend rather
@@ -186,6 +203,12 @@ class DriveState:
         self._pool = pool
         self._half_life_seconds = max(0.0, float(half_life_hours) * 3600.0)
 
+    def _half_life_for(self, drive: str) -> float:
+        """Effective decay half-life (seconds) for one drive: a registry override
+        if set, otherwise the store's global half-life."""
+        override = _HALF_LIFE_OVERRIDES.get(drive)
+        return override if override is not None else self._half_life_seconds
+
     @classmethod
     async def create(
         cls, pool: AsyncConnectionPool, *, half_life_hours: float
@@ -227,7 +250,7 @@ class DriveState:
                 float(level),
                 _BASELINES[drive],
                 float(elapsed or 0.0),
-                self._half_life_seconds,
+                self._half_life_for(drive),
             )
         return out
 
@@ -267,7 +290,7 @@ class DriveState:
                             float(row[0]),
                             baseline,
                             float(row[1] or 0.0),
-                            self._half_life_seconds,
+                            self._half_life_for(drive),
                         )
                     new_level = clamp_unit(current + delta)
                     await cur.execute(

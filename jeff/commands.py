@@ -389,12 +389,15 @@ def _format_remaining(seconds: float) -> str:
     return " ".join(parts) + " left"
 
 
-def _drive_band(level: float) -> str:
-    """One-word band for a drive level in the `/mind` dump (matches the prompt
-    block's thresholds so the operator view and what Jeff sees stay aligned)."""
-    if level >= 0.62:
+def _drive_band(level: float, baseline: float) -> str:
+    """One-word band for a drive level in the `/mind` dump, judged relative to the
+    drive's baseline (matches the prompt block's ``DRIVE_BAND_MARGIN`` so the
+    operator view and what Jeff sees stay aligned)."""
+    from .prompt import DRIVE_BAND_MARGIN
+
+    if level >= baseline + DRIVE_BAND_MARGIN:
         return "well-met"
-    if level <= 0.38:
+    if level <= baseline - DRIVE_BAND_MARGIN:
         return "running low"
     return "steady"
 
@@ -503,7 +506,8 @@ async def _cmd_mind(ctx: CommandContext) -> str:
         # Show each drive's decayed-to-now level plus a one-word band, so the
         # operator can see the balance the appraisal pass is steering.
         lines.extend(
-            f"  • {d.noun}: {levels[d.key]:.2f} ({_drive_band(levels[d.key])})"
+            f"  • {d.noun}: {levels[d.key]:.2f} "
+            f"({_drive_band(levels[d.key], d.baseline)})"
             for d in DRIVES
         )
         sections.append("\n".join(lines))
