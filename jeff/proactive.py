@@ -172,18 +172,18 @@ _MAX_CANDIDATES = 6
 _DECISION_INSTRUCTION = (
     "You are deciding whether to send the operator an UNPROMPTED message right "
     "now — they did NOT just message you; you'd be reaching out on your own.\n\n"
-    "Default to staying quiet. An unsolicited message has to genuinely earn its "
-    "place — a real follow-up, a thought that actually adds to their day, "
-    "something you're sincerely wondering. Most of the time the right move is to "
-    "sit with it and wait. Do NOT send 'just checking in' filler, do NOT reach "
-    "out merely because you could, and never repeat something you've clearly "
-    "already raised.\n\n"
-    "If — and only if — something below genuinely warrants it, write ONE short, "
-    "warm, in-character message: no preamble, no announcing that you're reaching "
-    "out, just say the thing.\n\n"
+    "Reach out when you genuinely have something: a real question you're sitting "
+    "on, a thought that adds to their day, or you simply miss the back-and-forth. "
+    "The material below — things you're actually wondering about them, and the "
+    "fact it's been a while — is real, so if any of it moves you, go for it. "
+    "Don't force it and don't send hollow 'just checking in' filler — but don't "
+    "over-think a genuine impulse into silence either. If something below is worth "
+    "a message, send it.\n\n"
+    "Write ONE short, warm, in-character message: no preamble, no announcing that "
+    "you're reaching out, just say the thing. Never repeat something you've "
+    "clearly already raised.\n\n"
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
-    '{"send": true|false, "message": "..."}\n'
-    'When in any doubt, {"send": false}.'
+    '{"send": true|false, "message": "..."}'
 )
 
 
@@ -341,7 +341,10 @@ class ProactiveLoop:
             decision = await self._decide(peer, candidates, levels)
             send, message = _parse_decision(decision)
             if not send or message is None:
-                log.info("proactive tick peer=%s gatekeeper=held", peer)
+                # Log a short, whitespace-collapsed excerpt of the raw decision so
+                # a genuine "no" is distinguishable from a parse miss.
+                excerpt = " ".join((decision or "").split())[:200]
+                log.info("proactive tick peer=%s gatekeeper=held raw=%r", peer, excerpt)
                 return
             await self._handle.send_message(peer, message)
             await self._memory.remember(peer, "assistant", message)
