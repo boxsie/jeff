@@ -45,6 +45,7 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     from .appraisal import DriveState
     from .config import Config
     from .curiosity import CuriosityStore
+    from .impulses import ImpulseStore
     from .memory import Memory, Message
     from .mood import MoodStore
     from .pinned import PinnedMemoryStore
@@ -94,6 +95,7 @@ class CommandContext:
     pinned: "PinnedMemoryStore | None" = None
     drives: "DriveState | None" = None
     proactive: "ProactiveStore | None" = None
+    impulses: "ImpulseStore | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -224,6 +226,10 @@ async def _cmd_forget(ctx: CommandContext) -> str:
     # too — wipe it so a clean slate starts the reach-out cadence fresh.
     if ctx.proactive is not None:
         await ctx.proactive.forget(ctx.peer)
+    # Self-set impulses are directions Jeff chose within this relationship — wipe
+    # them too so a clean slate carries no leftover steering.
+    if ctx.impulses is not None:
+        await ctx.impulses.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -434,6 +440,37 @@ async def _cmd_mood(ctx: CommandContext) -> str:
     )
 
 
+def _impulse_ttl(impulse) -> str:
+    """A ' · ~2h 10m left' suffix for a time-boxed impulse, '' when permanent.
+
+    Permanent impulses (no expiry) show nothing — the absence of a timer is the
+    signal. Shared by `/mind` and `/impulses`."""
+    if impulse.expires_at is None:
+        return ""
+    from datetime import datetime, timezone
+
+    remaining = (impulse.expires_at - datetime.now(timezone.utc)).total_seconds()
+    return " · " + _format_remaining(remaining)
+
+
+async def _cmd_impulses(ctx: CommandContext) -> str:
+    """List Jeff's active self-set impulses (strongest first). Declared only when
+    impulses are on. Deterministic dump, no model call."""
+    if ctx.impulses is None:
+        return "Impulses aren't switched on right now."
+    active = await ctx.impulses.list_active(ctx.peer)
+    if not active:
+        return (
+            "**impulses**\n```\nnone right now — I set these to steer myself.\n```"
+        )
+    lines = [
+        f"• [{'you' if i.source == 'operator' else 'me'}] "
+        f"{i.name} (×{i.strength}{_impulse_ttl(i)}): {_truncate(i.description)}"
+        for i in active
+    ]
+    return "**impulses**\n```\n" + "\n".join(lines) + "\n```"
+
+
 async def _cmd_remember(ctx: CommandContext) -> str:
     """Operator-facing pin: `/remember <text>` writes a note to the shared pinned
     store (same store the `remember` tool writes to), tagged source=operator.
@@ -523,11 +560,12 @@ async def _cmd_mind(ctx: CommandContext) -> str:
         and ctx.pinned is None
         and ctx.drives is None
         and ctx.proactive is None
+        and ctx.impulses is None
     ):
         return (
-            "None of curiosity, reflection, moods, pinned memory, drives, or "
-            "proactive messaging is switched on right now, so there's nothing on "
-            "my mind to show."
+            "None of curiosity, reflection, moods, pinned memory, drives, "
+            "impulses, or proactive messaging is switched on right now, so "
+            "there's nothing on my mind to show."
         )
 
     sections: list[str] = []
@@ -568,6 +606,22 @@ async def _cmd_mind(ctx: CommandContext) -> str:
             f"({_drive_band(levels[d.key], d.baseline)})"
             for d in DRIVES
         )
+        sections.append("\n".join(lines))
+
+    if ctx.impulses is not None:
+        active = await ctx.impulses.list_active(ctx.peer)
+        lines = [f"impulses ({len(active)}):"]
+        if active:
+            # Strongest first (list_active orders them). Show strength, source
+            # (me/you), and remaining time when time-boxed — these are Jeff's own
+            # directions, distinct from the standing drives above.
+            lines.extend(
+                f"  • [{'you' if i.source == 'operator' else 'me'}] "
+                f"{i.name} (×{i.strength}{_impulse_ttl(i)}): {_truncate(i.description)}"
+                for i in active
+            )
+        else:
+            lines.append("  (none right now — I set these to steer myself)")
         sections.append("\n".join(lines))
 
     if ctx.proactive is not None:
@@ -633,15 +687,16 @@ def build_command_registry(
     remember_enabled: bool = False,
     appraisal_enabled: bool = False,
     proactive_enabled: bool = False,
+    impulses_enabled: bool = False,
 ) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
 
     `/mind` is declared when any of curiosity / reflection / mood / remember /
-    appraisal / proactive is on; `/mood` only when the mood drive is on;
-    `/remember` only when the remember drive is on; `/mute`+`/unmute` only when
-    proactive messaging is on — keeping the feature-off path's declared command
-    set unchanged."""
+    appraisal / proactive / impulses is on; `/mood` only when the mood drive is
+    on; `/impulses` only when impulses are on; `/remember` only when the remember
+    drive is on; `/mute`+`/unmute` only when proactive messaging is on — keeping
+    the feature-off path's declared command set unchanged."""
     cmds = [
         Command(
             "clear",
@@ -669,6 +724,7 @@ def build_command_registry(
         or remember_enabled
         or appraisal_enabled
         or proactive_enabled
+        or impulses_enabled
     ):
         cmds.append(
             Command("mind", "show what's on my mind right now", _cmd_mind)
@@ -676,6 +732,10 @@ def build_command_registry(
     if mood_enabled:
         cmds.append(
             Command("mood", "show my current mood and how long it has left", _cmd_mood)
+        )
+    if impulses_enabled:
+        cmds.append(
+            Command("impulses", "show the directions I'm steering myself in", _cmd_impulses)
         )
     if remember_enabled:
         cmds.append(

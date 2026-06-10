@@ -14,6 +14,7 @@ from .commands import CommandContext, CommandRegistry, build_command_registry
 from .config import Config
 from .curiosity import CuriosityDriver, CuriosityStore
 from .dispatch import DispatchPolicy, TurnDispatcher
+from .impulses import ImpulseStore
 from .llm import ChatProvider, ChatResult
 from .llm import make_chat_provider
 from .memory import Memory
@@ -84,6 +85,7 @@ async def handle_turn(
     pinned_store: "PinnedMemoryStore | None" = None,
     drive_store: "DriveState | None" = None,
     appraisal_driver: "AppraisalDriver | None" = None,
+    impulse_store: "ImpulseStore | None" = None,
 ) -> None:
     """Process a single inbound chat turn.
 
@@ -174,6 +176,19 @@ async def handle_turn(
             except Exception as e:
                 log.error("drives fetch failed peer=%s exc=%s", peer, type(e).__name__)
 
+        # Jeff's active self-set impulses for this peer — surfaced into the
+        # prompt's "## What you're driving toward right now" block as ordered
+        # (name, description) pairs (strongest first; list_active does the
+        # ordering and lazy-expiry filtering). Best-effort + additive: a store
+        # read fault must never break the reply, so fall back to no block.
+        impulses: list[tuple[str, str]] = []
+        if impulse_store is not None:
+            try:
+                active_impulses = await impulse_store.list_active(peer)
+                impulses = [(i.name, i.description) for i in active_impulses]
+            except Exception as e:
+                log.error("impulses fetch failed peer=%s exc=%s", peer, type(e).__name__)
+
         # Build the prompt BEFORE persisting the current user message.
         # build_history appends the current turn explicitly; if we stored it
         # first, recent()/recall() would also return it and the message would
@@ -195,6 +210,8 @@ async def handle_turn(
             pinned=pinned,
             drives=drives,
             drives_max_chars=cfg.drives_max_chars,
+            impulses=impulses,
+            impulses_max_chars=cfg.impulses_max_chars,
         )
         # Persist after building but before the model call, so the user turn is
         # still recorded even if the chat/tool call fails (matches prior behaviour).
@@ -489,13 +506,31 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("proactive disabled")
 
-            # Registry built AFTER the stores so the mood tools can be wired to
-            # the mood store. Empty when tools are off → the no-tools turn path.
+            # Impulses (motivation slice) — self-authored short-term directional
+            # drives. Default OFF: built only when enabled so the disabled path
+            # makes no extra DB calls and stays byte-identical. Plain Postgres (no
+            # embedder). The store backs the per-turn impulse-block fetch, the
+            # set/adjust/clear tools, and /mind.
+            impulse_store: ImpulseStore | None = None
+            if cfg.impulses_enabled:
+                impulse_store = await ImpulseStore.create(pool)
+                log.info(
+                    "impulses enabled (default %gh, max %gh, max %d chars)",
+                    cfg.impulses_default_hours,
+                    cfg.impulses_max_hours,
+                    cfg.impulses_max_chars,
+                )
+            else:
+                log.info("impulses disabled")
+
+            # Registry built AFTER the stores so the mood/impulse tools can be
+            # wired to their stores. Empty when tools are off → the no-tools path.
             registry = build_registry(
                 cfg,
                 searxng=searxng,
                 mood_store=mood_store,
                 pinned_store=pinned_store,
+                impulse_store=impulse_store,
             )
             if cfg.tools_enabled and len(registry):
                 # Names only — never tool args (the leaky-info discipline).
@@ -520,6 +555,7 @@ async def run(cfg: Config) -> None:
                     remember_enabled=cfg.remember_enabled,
                     appraisal_enabled=cfg.appraisal_enabled,
                     proactive_enabled=cfg.proactive_enabled,
+                    impulses_enabled=cfg.impulses_enabled,
                 )
                 if cfg.commands_enabled
                 else None
@@ -571,6 +607,7 @@ async def run(cfg: Config) -> None:
                             pinned_store,
                             drive_store,
                             appraisal_driver,
+                            impulse_store,
                         )
 
                     dispatcher = TurnDispatcher(_on_turn, _policy_from_config(cfg))
@@ -616,6 +653,7 @@ async def run(cfg: Config) -> None:
                                 pinned_store,
                                 drive_store,
                                 appraisal_driver,
+                                impulse_store,
                             )
 
                         signal_dispatcher = TurnDispatcher(
@@ -678,6 +716,7 @@ async def run(cfg: Config) -> None:
                             drive_store,
                             proactive_store,
                             presence,
+                            impulse_store,
                         ),
                         name="jeff-events",
                     )
@@ -726,6 +765,7 @@ async def _handle_command(
     pinned_store: "PinnedMemoryStore | None" = None,
     drive_store: "DriveState | None" = None,
     proactive_store: "ProactiveStore | None" = None,
+    impulse_store: "ImpulseStore | None" = None,
 ) -> None:
     """Run a daemon-routed command invocation and reply via the command channel.
 
@@ -752,6 +792,7 @@ async def _handle_command(
         pinned=pinned_store,
         drives=drive_store,
         proactive=proactive_store,
+        impulses=impulse_store,
     )
     reply = await commands.dispatch(inv.name, ctx)
     try:
@@ -775,6 +816,7 @@ async def _drain_events(
     drive_store: "DriveState | None" = None,
     proactive_store: "ProactiveStore | None" = None,
     presence: "Presence | None" = None,
+    impulse_store: "ImpulseStore | None" = None,
 ) -> None:
     allow = set(cfg.allowlist)
     async for event in handle.events():
@@ -810,6 +852,7 @@ async def _drain_events(
                 pinned_store,
                 drive_store,
                 proactive_store,
+                impulse_store,
             )
             continue
         if not isinstance(event, ensemble.ChatMessage):

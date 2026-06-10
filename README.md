@@ -100,6 +100,10 @@ Jeff prints its registered Ensemble address + onion on startup. Add that address
 | `JEFF_PROACTIVE_CONNECTION_THRESHOLD` | `0.35` | Reach-out pressure bar: the loop only considers messaging when the `connection` drive has decayed below this (it rests low at 0.2 and is bumped up by warm exchanges, so this is "it's been a while"). |
 | `JEFF_PROACTIVE_MIN_GAP_S` | `1800` | Hard minimum gap between unprompted messages — an anti-machine-gun fuse, not a politeness cooldown. |
 | `JEFF_PROACTIVE_PRESENCE_TTL_S` | `3600` | How long after the operator's last inbound event Jeff still treats them as reachable. Generous so a reconnect-after-silence is the natural moment to reach out (the SDK has no transport-presence signal; recent activity is the proxy). |
+| `JEFF_IMPULSES_ENABLED` | `false` | Impulses: self-authored short-term *directional drives* Jeff sets via the `set_impulse` tool — a named nudge ("test new autonomy edges") that biases what it reaches for. Distinct from the standing appraisal drives (continuous needs); impulses are transient directions Jeff *chooses* and can `adjust_impulse` (escalate/fade/renew) or `clear_impulse`. Rides in the prompt as an additive "What you're driving toward right now" block. Default no expiry (sticks until cleared); a per-impulse timer is optional. Off ⇒ no extra store/tools (byte-identical to today). Adds the `/impulses` command and an impulses section to `/mind`. Needs `JEFF_TOOLS_ENABLED`. |
+| `JEFF_IMPULSES_DEFAULT_HOURS` | `6` | How many hours an impulse's timer lasts when Jeff sets one without saying (impulses are permanent by default; this only applies when a timer is requested). |
+| `JEFF_IMPULSES_MAX_HOURS` | `168` | Hard ceiling on any single impulse's timer (the tool clamps to this). |
+| `JEFF_IMPULSES_MAX_CHARS` | `2000` | Cap on a stored impulse description's length (tool-enforced, with a higher hard byte cap in the store as defence-in-depth). |
 | `JEFF_SIGNAL_ENABLED` | `false` | Signal front door: a second inbound channel where you text Jeff's dedicated Signal number and it replies on the same thread, reusing the whole turn pipeline (memory, tools, drives). Off ⇒ no Signal client/loop (byte-identical to today). Needs a registered number + a running [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) in `json-rpc` mode. |
 | `JEFF_SIGNAL_API_URL` | `http://localhost:8080` | Base URL of the signal-cli-rest-api instance. Startup fails fast if Signal is enabled but this is empty. |
 | `JEFF_SIGNAL_NUMBER` | _empty_ | Jeff's own registered Signal number (E.164). **Required** when `JEFF_SIGNAL_ENABLED=true` (startup fails fast if missing). |
@@ -126,7 +130,8 @@ clears your local transcript while Jeff's leg resets its working memory window.
 | `/forget` | **Hard wipe** — permanently deletes every stored message for you. Irreversible, so it's confirm-gated: send `/forget yes` to actually wipe. Jeff-only; no daemon counterpart. |
 | `/stats` | Stored-message counts (you + all peers), process uptime, active provider/model, and system-prompt source. No secrets. |
 | `/debug` | Deterministic introspection of Jeff's working context: effective system prompt, session cutoff, recent window, and what recall would surface (with cosine distances). `/debug prompt` and `/debug recall <query>` for the detail views. |
-| `/mind` | What Jeff is curious about, its persona/mood/drives, and (when proactive is on) its reach-out state. Declared when any of curiosity / reflection / mood / remember / appraisal / proactive is on. |
+| `/mind` | What Jeff is curious about, its persona/mood/drives/impulses, and (when proactive is on) its reach-out state. Declared when any of curiosity / reflection / mood / remember / appraisal / proactive / impulses is on. |
+| `/impulses` | List the self-set directional impulses Jeff is currently steering itself with (strongest first, with strength, source, and remaining time if timed). Only declared when `JEFF_IMPULSES_ENABLED` is on. |
 | `/mute` | Stop Jeff reaching out **unprompted** for a while (`/mute`, or `/mute 2h` / `30m` / `1d`). Reactive replies are unaffected. Only declared when `JEFF_PROACTIVE_ENABLED` is on. |
 | `/unmute` | Lift a `/mute` so Jeff can reach out again. Only declared when `JEFF_PROACTIVE_ENABLED` is on. |
 
@@ -154,6 +159,8 @@ Tools available today:
 
 - **`get_time`** — current UTC time (zero-dependency built-in).
 - **`web_search` / `image_search`** — query the self-hosted [SearXNG](https://docs.searxng.org/) metasearch proxy (enable with `JEFF_SEARCH_ENABLED`). Jeff only ever talks to SearXNG, and returns **links + text only**: it does not fetch the result pages or image bytes (auto-fetching would re-leak interest to third parties and is an SSRF vector). The model surfaces citations the operator clicks.
+- **`set_mood` / `define_mood` / `clear_mood`** — Jeff's affective self-state (enable with `JEFF_MOOD_ENABLED`); a short-lived mood that colours its tone until it fades.
+- **`set_impulse` / `adjust_impulse` / `clear_impulse`** — Jeff's self-set directional **impulses** (enable with `JEFF_IMPULSES_ENABLED`): a named nudge it gives itself to steer its own behaviour for a while (escalate/fade/renew/clear as it evolves). Agency/self-expression, not accuracy — part of the inner-life / motivation-loop work.
 
 ## Memory
 

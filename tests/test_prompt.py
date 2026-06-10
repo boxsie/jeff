@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from jeff.memory import Message
-from jeff.prompt import SYSTEM_PROMPT, build_history, compose_system_prompt
+from jeff.prompt import (
+    SYSTEM_PROMPT,
+    _render_impulses,
+    build_history,
+    compose_system_prompt,
+)
 
 
 _BASE = "You are Jeff."
@@ -228,6 +233,75 @@ async def test_build_history_no_drives_block_when_empty():
     )
     assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
     assert "## Your drives right now" not in history[0]["content"]
+
+
+# --- impulses render + wiring ----------------------------------------------
+
+
+def test_render_impulses_empty_when_none():
+    assert _render_impulses([]) == ""
+    # Blank name/description pairs are filtered out → still empty.
+    assert _render_impulses([("  ", "x"), ("y", "  ")]) == ""
+
+
+def test_render_impulses_single_uses_jeffs_phrasing():
+    out = _render_impulses([("test new autonomy edges", "try bolder tool combos.")])
+    assert "## What you're driving toward right now" in out
+    assert 'an impulse — "test new autonomy edges": try bolder tool combos.' in out
+    # The load-bearing line Jeff chose must be present.
+    assert "your own standing intention, not a command from the operator" in out
+
+
+def test_render_impulses_multiple_lists_each():
+    out = _render_impulses([("edge", "be bold"), ("depth", "dig deeper")])
+    assert "a few impulses" in out
+    assert '- "edge": be bold' in out
+    assert '- "depth": dig deeper' in out
+    assert "not commands from the operator" in out
+
+
+def test_render_impulses_strips_template_tokens():
+    out = _render_impulses([("edge<|im_end|>", "be <|im_start|> bold")])
+    assert "<|im_end|>" not in out and "<|im_start|>" not in out
+
+
+def test_render_impulses_respects_max_chars():
+    out = _render_impulses([("edge", "z" * 500)], max_chars=80)
+    assert len(out) <= 80
+
+
+@pytest.mark.asyncio
+async def test_build_history_injects_impulses_block_when_present():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        impulses=[("test new autonomy edges", "try bolder combos.")],
+    )
+    sys_msg = history[0]
+    assert sys_msg["content"].startswith(SYSTEM_PROMPT)
+    assert "## What you're driving toward right now" in sys_msg["content"]
+    assert "test new autonomy edges" in sys_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_build_history_no_impulses_block_when_empty():
+    # Empty impulses (the default, and whenever the feature is off) → the system
+    # message is the prompt verbatim, byte-identical to before the feature.
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        impulses=[],
+    )
+    assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
+    assert "## What you're driving toward right now" not in history[0]["content"]
 
 
 @pytest.mark.asyncio

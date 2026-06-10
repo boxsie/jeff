@@ -10,11 +10,13 @@ own — keeping the wiring in one auditable spot.
 from __future__ import annotations
 
 from ..config import Config
+from ..impulses import ImpulseStore
 from ..mood import MoodStore
 from ..pinned import PinnedMemoryStore
 from ..searxng import SearxngClient
 from .base import DEFAULT_TOOL_TIMEOUT_S, Tool, ToolRegistry
 from .builtins import GetTimeTool
+from .impulses import AdjustImpulseTool, ClearImpulseTool, SetImpulseTool
 from .mood import ClearMoodTool, DefineMoodTool, SetMoodTool
 from .remember import RememberTool
 from .search import ImageSearchTool, WebSearchTool
@@ -34,6 +36,7 @@ def build_registry(
     searxng: SearxngClient | None = None,
     mood_store: MoodStore | None = None,
     pinned_store: PinnedMemoryStore | None = None,
+    impulse_store: ImpulseStore | None = None,
 ) -> ToolRegistry:
     """Construct the active tool registry for this configuration.
 
@@ -65,4 +68,13 @@ def build_registry(
         tools.append(ClearMoodTool(mood_store, **kw))
     if cfg.remember_enabled and pinned_store is not None:
         tools.append(RememberTool(pinned_store, max_chars=cfg.remember_max_chars))
+    if cfg.impulses_enabled and impulse_store is not None:
+        kw = {
+            "default_hours": cfg.impulses_default_hours,
+            "max_hours": cfg.impulses_max_hours,
+            "max_chars": cfg.impulses_max_chars,
+        }
+        tools.append(SetImpulseTool(impulse_store, **kw))
+        tools.append(AdjustImpulseTool(impulse_store, **kw))
+        tools.append(ClearImpulseTool(impulse_store, **kw))
     return ToolRegistry(tools)

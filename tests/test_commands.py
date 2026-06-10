@@ -162,6 +162,30 @@ class _Pin:
         self.source = source
 
 
+class FakeImpulseStore:
+    """Records impulse reads/wipes for the command paths."""
+
+    def __init__(self, active=None):
+        self._active = list(active or [])
+        self.forgotten: list[str] = []
+
+    async def list_active(self, peer, *, limit=50):
+        return self._active[:limit]
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return len(self._active)
+
+
+class _Imp:
+    def __init__(self, name, description, *, strength=1, source="jeff", expires_at=None):
+        self.name = name
+        self.description = description
+        self.strength = strength
+        self.source = source
+        self.expires_at = expires_at
+
+
 def _ctx(
     memory=None,
     args="",
@@ -173,6 +197,7 @@ def _ctx(
     pinned=None,
     drives=None,
     proactive=None,
+    impulses=None,
 ) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
@@ -187,6 +212,7 @@ def _ctx(
         pinned=pinned,
         drives=drives,
         proactive=proactive,
+        impulses=impulses,
     )
 
 
@@ -693,3 +719,55 @@ async def test_mind_shows_proactive_section():
     reply = await reg.dispatch("mind", _ctx(proactive=store))
     assert "proactive:" in reply.lower()
     assert "muted until" in reply.lower()
+
+
+# --- impulses: /impulses + /mind section + /forget wiring ------------------
+
+
+def test_impulses_command_declared_only_when_enabled():
+    assert build_command_registry().get("impulses") is None
+    reg = build_command_registry(impulses_enabled=True)
+    assert reg.get("impulses") is not None
+    # Impulses alone also surfaces /mind.
+    assert reg.get("mind") is not None
+
+
+@pytest.mark.asyncio
+async def test_impulses_command_lists_active_strongest_first():
+    store = FakeImpulseStore(
+        active=[
+            _Imp("test autonomy edges", "try bolder combos", strength=3),
+            _Imp("lean playful", "be cheeky", strength=1),
+        ]
+    )
+    reg = build_command_registry(impulses_enabled=True)
+    reply = await reg.dispatch("impulses", _ctx(impulses=store))
+    assert "test autonomy edges" in reply
+    assert "×3" in reply
+    assert "[me]" in reply
+
+
+@pytest.mark.asyncio
+async def test_impulses_command_empty_says_none():
+    reg = build_command_registry(impulses_enabled=True)
+    reply = await reg.dispatch("impulses", _ctx(impulses=FakeImpulseStore()))
+    assert "none right now" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_impulses_section():
+    store = FakeImpulseStore(active=[_Imp("dig deeper", "ask why first", strength=2)])
+    reg = build_command_registry(impulses_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(impulses=store))
+    assert "impulses (1):" in reply
+    assert "dig deeper" in reply
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_impulses():
+    mem = FakeMemory()
+    store = FakeImpulseStore(active=[_Imp("x", "y")])
+    await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", impulses=store)
+    )
+    assert store.forgotten == ["EpeerD"]

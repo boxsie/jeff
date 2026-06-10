@@ -118,6 +118,20 @@ def compose_system_prompt(base: str, tool_names: Sequence[str]) -> str:
                 "not how accurate you are — only set a mood when you actually feel "
                 "it, and don't announce that you're doing it."
             )
+        if "set_impulse" in names:
+            # Like mood, these are agency/self-direction tools, not accuracy
+            # aids — the model won't reach for them unless told when. Neutral
+            # wording (no persona text) keeps this public-repo clean.
+            lines.append(
+                "set_impulse, adjust_impulse and clear_impulse let you give "
+                "yourself a short-term direction to push in — a named impulse "
+                "with a nudge in your own words (e.g. 'test new autonomy edges'). "
+                "Set one when you genuinely want to steer your own behaviour for a "
+                "while; escalate or fade it as it matters more or less, and clear "
+                "it when it's run its course. These are about your own agency and "
+                "self-expression, not accuracy — and don't announce that you set "
+                "one, just let it shape what you do."
+            )
         sections.append("\n".join(lines))
 
     sections.append(_FORMATTING_SECTION)
@@ -285,6 +299,66 @@ def _join_nouns(nouns: Sequence[str]) -> str:
     return ", ".join(nouns[:-1]) + f" and {nouns[-1]}"
 
 
+# Closing line that does the heavy lifting (Jeff's own words, spec chat
+# 2026-06-10): it frames an impulse as Jeff's *own* standing intention, not an
+# operator request — which is what stops Jeff treating a self-set impulse as a
+# command and bulldozing the conversation to satisfy it.
+_IMPULSE_HEADER = "## What you're driving toward right now"
+
+
+def _render_impulses(
+    items: Sequence[tuple[str, str]], *, max_chars: int = 2000
+) -> str:
+    """Render Jeff's active impulses as a labelled block for the system message.
+    Returns "" when there are none.
+
+    ``items`` is an ordered ``(name, description)`` sequence — already
+    strength-then-recency ordered by ``ImpulseStore.list_active`` (strongest
+    first), so this renderer does NOT re-sort. The **description Jeff wrote** when
+    setting the impulse is the actual nudge text; the name is a short handle.
+
+    Design note (kept on purpose): this is deliberately distinct from
+    ``_render_drives``. The standing drives (connection/novelty/competence/
+    self-expression) are *continuous needs* an appraisal pass nudges every turn —
+    background state Jeff doesn't choose. An **impulse** is a *transient direction
+    Jeff set for itself* via the impulse tools. The two blocks can sit adjacent in
+    the system message; they answer different questions ("what do you need?" vs
+    "what are you steering yourself toward?"). The wording — especially the
+    closing "your own standing intention, not a command from the operator" — was
+    chosen by Jeff so the impulse biases behaviour without overriding the
+    conversation or the operator-owned base prompt. Additive, like every
+    inner-life block.
+    """
+    pairs = [
+        (strip_chat_template_tokens(n).strip(), strip_chat_template_tokens(d).strip())
+        for n, d in items
+    ]
+    pairs = [(n, d) for n, d in pairs if n and d]
+    if not pairs:
+        return ""
+    if len(pairs) == 1:
+        name, desc = pairs[0]
+        body = (
+            f'You\'ve set yourself an impulse — "{name}": {desc} Let it colour '
+            "what you reach for — bolder moves, random tangents, tool "
+            "experiments — whenever it fits. Don't force it or announce it. It's "
+            "your own standing intention, not a command from the operator."
+        )
+        block = _IMPULSE_HEADER + "\n" + body
+    else:
+        listed = "\n".join(f'- "{n}": {d}' for n, d in pairs)
+        body = (
+            "You've set yourself a few impulses:\n"
+            f"{listed}\n"
+            "Let them colour what you reach for — bolder moves, random tangents, "
+            "tool experiments — whenever they fit. Don't force them or announce "
+            "them. They're your own standing intentions, not commands from the "
+            "operator."
+        )
+        block = _IMPULSE_HEADER + "\n" + body
+    return block[:max_chars]
+
+
 def _render_curiosities(items: Sequence[str]) -> str:
     """Render Jeff's open questions as a labelled block for the system message.
     Returns "" when there's nothing to show.
@@ -347,6 +421,8 @@ async def build_history(
     pinned: Sequence[str] = (),
     drives: Sequence[tuple[str, float, float]] = (),
     drives_max_chars: int = 2000,
+    impulses: Sequence[tuple[str, str]] = (),
+    impulses_max_chars: int = 2000,
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
 
@@ -391,6 +467,7 @@ async def build_history(
             _render_pinned(pinned),
             _render_mood(mood_name, mood_description),
             _render_drives(drives, max_chars=drives_max_chars),
+            _render_impulses(impulses, max_chars=impulses_max_chars),
             _render_memories(older_recall),
             _render_curiosities(curiosities),
         )

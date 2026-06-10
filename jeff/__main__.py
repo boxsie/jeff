@@ -18,6 +18,7 @@ from .config import Config, ConfigError
 from .curiosity import CuriosityStore
 from .main import run as _run
 from .memory import Memory
+from .impulses import ImpulseStore
 from .mood import MoodStore
 from .ollama import Ollama
 from .pinned import PinnedMemoryStore
@@ -128,10 +129,13 @@ async def _reset_memory(cfg: Config) -> None:
             # Proactive bookkeeping is a plain table too — recreate on clean slate.
             proactive = ProactiveStore(pool)
             await proactive.reset()
+            # Impulses are a plain table too — recreate on clean slate.
+            impulses = ImpulseStore(pool)
+            await impulses.reset()
             print(
                 f"memory reset — messages + curiosities + derived_memory + mood + "
-                f"pinned + drive_state + proactive_state schema recreated at "
-                f"dim={cfg.embed_dim} (model={cfg.embed_model})"
+                f"pinned + drive_state + proactive_state + impulses schema "
+                f"recreated at dim={cfg.embed_dim} (model={cfg.embed_model})"
             )
     finally:
         await pool.close()

@@ -207,6 +207,11 @@ class Config:
     mood_max_hours: float
     mood_max_chars: int
 
+    impulses_enabled: bool
+    impulses_default_hours: float
+    impulses_max_hours: float
+    impulses_max_chars: int
+
     remember_enabled: bool
     remember_max_items: int
     remember_max_chars: int
@@ -355,6 +360,17 @@ class Config:
             mood_default_hours=float(e.get("JEFF_MOOD_DEFAULT_HOURS", "6")),
             mood_max_hours=float(e.get("JEFF_MOOD_MAX_HOURS", "48")),
             mood_max_chars=int(e.get("JEFF_MOOD_MAX_CHARS", "2000")),
+            # Impulses (self-authored short-term directional drives, motivation
+            # slice) — default OFF: when off the store/tools/command are never
+            # built, so behaviour is byte-identical. Jeff sets impulses at runtime
+            # via tools; they default to NO expiry (permanent until cleared), and
+            # default_hours/max_hours apply only when Jeff sets a timer on one.
+            # max_chars caps the description (tool-enforced, with a higher hard
+            # byte cap in the store as defence-in-depth).
+            impulses_enabled=_parse_bool(e.get("JEFF_IMPULSES_ENABLED", "false")),
+            impulses_default_hours=float(e.get("JEFF_IMPULSES_DEFAULT_HOURS", "6")),
+            impulses_max_hours=float(e.get("JEFF_IMPULSES_MAX_HOURS", "168")),
+            impulses_max_chars=int(e.get("JEFF_IMPULSES_MAX_CHARS", "2000")),
             # Explicit/pinned memory (inner-life slice 4) — default OFF: when off
             # the store/tool/command are never built, so behaviour is
             # byte-identical. Jeff pins via the `remember` tool, the operator via
