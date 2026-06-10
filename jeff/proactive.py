@@ -46,6 +46,8 @@ from typing import TYPE_CHECKING, Sequence
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .config import Config
     from .curiosity import CuriosityStore
@@ -87,6 +89,21 @@ _DDL_MIGRATE_ASKED = sql.SQL(
     "ADD COLUMN IF NOT EXISTS last_asked_curiosity_ids BIGINT[]"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard. The original dbafb5ea failure was a proactive_state from the reverted
+# inner-life branch missing last_send_at/last_nudge_key/muted_until: those are a
+# shape change the additive ALTER above can't express, so the guard names them at
+# deploy (→ reset-memory) instead of letting get_state throw UndefinedColumn mid-turn.
+_EXPECTED_COLUMNS = frozenset(
+    {
+        "peer",
+        "last_send_at",
+        "last_nudge_key",
+        "muted_until",
+        "last_asked_curiosity_ids",
+    }
+)
+
 
 class ProactiveStore:
     """Per-peer proactive state (plain Postgres; mirrors MoodStore/DriveState).
@@ -112,6 +129,7 @@ class ProactiveStore:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL)
                 await cur.execute(_DDL_MIGRATE_ASKED)
+                await assert_columns(cur, "proactive_state", _EXPECTED_COLUMNS)
             await conn.commit()
 
     async def get_state(self, peer: str) -> ProactiveState:

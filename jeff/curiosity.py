@@ -45,6 +45,7 @@ from pgvector.psycopg import register_vector_async
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
 from .reflection import FACT
 from .screen import strip_chat_template_tokens
 
@@ -139,6 +140,23 @@ _DDL_IDX_EMBEDDING = sql.SQL(
     "ON curiosities USING hnsw (embedding vector_cosine_ops)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard (alongside the embed-dim guard) so an older curiosities table missing
+# one fails loudly at deploy, not mid-turn.
+_EXPECTED_COLUMNS = frozenset(
+    {
+        "id",
+        "peer",
+        "text",
+        "embedding",
+        "status",
+        "kind",
+        "created_at",
+        "satisfied_at",
+        "provenance",
+    }
+)
+
 
 def _row_to_curiosity(r) -> Curiosity:
     return Curiosity(
@@ -197,6 +215,7 @@ class CuriosityStore:
                 await cur.execute(table_ddl)
                 await cur.execute(_DDL_IDX_PEER_STATUS)
                 await cur.execute(_DDL_IDX_EMBEDDING)
+                await assert_columns(cur, "curiosities", _EXPECTED_COLUMNS)
             await conn.commit()
             await register_vector_async(conn)
 

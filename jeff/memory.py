@@ -17,6 +17,7 @@ from pgvector.psycopg import register_vector_async
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
 from .screen import strip_chat_template_tokens
 
 
@@ -88,6 +89,14 @@ _DDL_PEER_STATE = sql.SQL(
     "history_cutoff TIMESTAMPTZ)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard (alongside the embed-dim guard) so an older table missing one fails
+# loudly at deploy, not mid-turn.
+_MESSAGES_COLUMNS = frozenset(
+    {"id", "peer", "role", "content", "embedding", "ts"}
+)
+_PEER_STATE_COLUMNS = frozenset({"peer", "history_cutoff"})
+
 
 class Memory:
     """Async memory store backed by Postgres + pgvector."""
@@ -137,6 +146,8 @@ class Memory:
                 await cur.execute(_DDL_IDX_PEER_TS)
                 await cur.execute(_DDL_IDX_EMBEDDING)
                 await cur.execute(_DDL_PEER_STATE)
+                await assert_columns(cur, "messages", _MESSAGES_COLUMNS)
+                await assert_columns(cur, "peer_state", _PEER_STATE_COLUMNS)
             await conn.commit()
             await register_vector_async(conn)
 

@@ -51,6 +51,7 @@ from datetime import datetime
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
 from .screen import strip_chat_template_tokens
 
 
@@ -141,6 +142,23 @@ _DDL_IDX = sql.SQL(
     "ON impulses(peer, expires_at)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard so an older impulses table missing one fails loudly at deploy, not mid-turn.
+_EXPECTED_COLUMNS = frozenset(
+    {
+        "id",
+        "peer",
+        "name",
+        "description",
+        "strength",
+        "source",
+        "started_at",
+        "expires_at",
+        "created_at",
+        "updated_at",
+    }
+)
+
 
 class ImpulseStore:
     """Async store of a peer's self-authored impulses (plain Postgres).
@@ -164,6 +182,7 @@ class ImpulseStore:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL_TABLE)
                 await cur.execute(_DDL_IDX)
+                await assert_columns(cur, "impulses", _EXPECTED_COLUMNS)
             await conn.commit()
 
     async def set(

@@ -47,6 +47,7 @@ import numpy as np
 from pgvector.psycopg import register_vector_async
 from psycopg import sql
 
+from ._schema import assert_columns
 from .screen import strip_chat_template_tokens
 
 if TYPE_CHECKING:
@@ -143,6 +144,23 @@ _DDL_IDX_EMBEDDING = sql.SQL(
     "ON derived_memory USING hnsw (embedding vector_cosine_ops)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard (alongside the embed-dim guard) so an older derived_memory missing one
+# fails loudly at deploy, not mid-turn.
+_EXPECTED_COLUMNS = frozenset(
+    {
+        "id",
+        "peer",
+        "kind",
+        "text",
+        "embedding",
+        "salience",
+        "source",
+        "last_accessed",
+        "created_at",
+    }
+)
+
 
 _SELECT_COLS = "id, peer, kind, text, salience, source, last_accessed, created_at"
 
@@ -202,6 +220,7 @@ class ReflectionStore:
                 await cur.execute(table_ddl)
                 await cur.execute(_DDL_IDX_PEER_KIND)
                 await cur.execute(_DDL_IDX_EMBEDDING)
+                await assert_columns(cur, "derived_memory", _EXPECTED_COLUMNS)
             await conn.commit()
             await register_vector_async(conn)
 

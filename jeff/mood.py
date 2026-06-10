@@ -44,6 +44,7 @@ from datetime import datetime
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
 from .screen import strip_chat_template_tokens
 
 
@@ -125,6 +126,15 @@ _DDL_IDX_STATE = sql.SQL(
     "ON mood_state(peer, expires_at DESC)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard so an older mood table missing one fails loudly at deploy, not mid-turn.
+_DEFINITIONS_COLUMNS = frozenset(
+    {"id", "peer", "name", "description", "created_at", "updated_at"}
+)
+_STATE_COLUMNS = frozenset(
+    {"id", "peer", "name", "started_at", "expires_at", "source", "note"}
+)
+
 
 class MoodStore:
     """Async store of a peer's mood definitions + state (plain Postgres).
@@ -149,6 +159,8 @@ class MoodStore:
                 await cur.execute(_DDL_DEFINITIONS)
                 await cur.execute(_DDL_STATE)
                 await cur.execute(_DDL_IDX_STATE)
+                await assert_columns(cur, "mood_definitions", _DEFINITIONS_COLUMNS)
+                await assert_columns(cur, "mood_state", _STATE_COLUMNS)
             await conn.commit()
 
     # --- definitions (Jeff's own vocabulary) -------------------------------

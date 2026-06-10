@@ -1,3 +1,3 @@
 """Jeff — personal AI assistant on the Ensemble P2P network."""
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"

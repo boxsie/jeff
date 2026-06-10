@@ -41,6 +41,7 @@ from datetime import datetime
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
 from .screen import strip_chat_template_tokens
 
 
@@ -94,6 +95,12 @@ _DDL_IDX = sql.SQL(
     "ON pinned_memory(peer, created_at DESC)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard so an older pinned_memory missing one fails loudly at deploy, not mid-turn.
+_EXPECTED_COLUMNS = frozenset(
+    {"id", "peer", "text", "norm", "source", "created_at"}
+)
+
 
 class PinnedMemoryStore:
     """Async store of a peer's deliberately-pinned memories (plain Postgres).
@@ -116,6 +123,7 @@ class PinnedMemoryStore:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL_TABLE)
                 await cur.execute(_DDL_IDX)
+                await assert_columns(cur, "pinned_memory", _EXPECTED_COLUMNS)
             await conn.commit()
 
     async def add(

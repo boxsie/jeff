@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING
 from psycopg import sql
 from psycopg_pool import AsyncConnectionPool
 
+from ._schema import assert_columns
 from .screen import strip_chat_template_tokens
 
 if TYPE_CHECKING:
@@ -188,6 +189,12 @@ _DDL_IDX_PEER = sql.SQL(
     "CREATE INDEX IF NOT EXISTS idx_drive_state_peer ON drive_state(peer)"
 )
 
+# Columns the queries below rely on — checked at startup by the shared drift
+# guard so an older drive_state missing one fails loudly at deploy, not mid-turn.
+_EXPECTED_COLUMNS = frozenset(
+    {"id", "peer", "drive", "level", "updated_at"}
+)
+
 
 class DriveState:
     """Async store of a peer's drive levels (plain Postgres, lazy read-time decay).
@@ -222,6 +229,7 @@ class DriveState:
             async with conn.cursor() as cur:
                 await cur.execute(_DDL_TABLE)
                 await cur.execute(_DDL_IDX_PEER)
+                await assert_columns(cur, "drive_state", _EXPECTED_COLUMNS)
             await conn.commit()
 
     async def levels(self, peer: str) -> dict[str, float]:
