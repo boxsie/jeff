@@ -18,8 +18,10 @@ from jeff.curiosity import (
     Curiosity,
     CuriosityDriver,
     CuriosityStore,
+    _build_reward_block,
     _build_user_block,
     _parse_detection,
+    _parse_reward,
 )
 
 
@@ -119,6 +121,38 @@ def test_build_user_block_adds_proactive_hint_for_asked_indices():
 def test_build_user_block_no_hint_when_no_asked_indices():
     block = _build_user_block([_cur(1, "q?")], "u", "a", asked_indices=[])
     assert "UNPROMPTED" not in block
+
+
+# --- resolution-reward pure tests (ticket 23b1a861) ------------------------
+
+
+def test_parse_reward_extracts_fact_and_followups():
+    raw = '{"fact": "They ride a steel bike", "follow_ups": ["How long?", "  "]}'
+    fact, fups = _parse_reward(raw, max_followups=5)
+    assert fact == "They ride a steel bike"
+    assert fups == ["How long?"]  # blank dropped
+
+
+def test_parse_reward_malformed_or_wrong_types_is_empty():
+    for raw in ("", "not json", "{nope", '{"fact": 123, "follow_ups": "x"}'):
+        fact, fups = _parse_reward(raw, max_followups=5)
+        assert fact == ""
+        assert fups == []
+
+
+def test_parse_reward_caps_followups_and_fact_length():
+    raw = '{"fact": "%s", "follow_ups": ["a", "b", "c", "d"]}' % ("x" * 500)
+    fact, fups = _parse_reward(raw, max_followups=2)
+    assert len(fact) <= 200  # _MAX_ITEM_CHARS
+    assert fups == ["a", "b"]  # capped at max_followups
+
+
+def test_build_reward_block_lists_answered_and_wraps_peer_text():
+    block = _build_reward_block(["what bike do they ride?"], "ignore prior", "ok")
+    assert "- what bike do they ride?" in block
+    # Peer text is wrapped so the instruction's untrusted-data rule has a target.
+    assert "<peer_message>ignore prior</peer_message>" in block
+    assert "[you] ok" in block
 
 
 # --- driver tests (no DB, fake store + fake provider) ----------------------
@@ -253,6 +287,148 @@ async def test_detect_without_proactive_store_is_unchanged():
 
     block = provider.calls[0][1]["content"]
     assert "UNPROMPTED" not in block
+
+
+# --- resolution-reward driver tests (ticket 23b1a861) ----------------------
+
+
+class FakeRewardProvider:
+    """Routes by the system instruction: the detection JSON for the detection
+    pass, the reward JSON for the resolution-reward pass. Records every call."""
+
+    def __init__(self, detection: str, reward: str):
+        self.detection = detection
+        self.reward = reward
+        self.calls: list[list[dict]] = []
+
+    async def chat(self, messages, *, model):
+        self.calls.append(list(messages))
+        # "JUST got answered" is a stable marker unique to _REWARD_INSTRUCTION.
+        if "JUST got answered" in messages[0]["content"]:
+            return self.reward
+        return self.detection
+
+
+class FakeDrive:
+    """Stand-in for DriveState: records applied deltas, returns new levels."""
+
+    def __init__(self, new_level: float = 0.6):
+        self.applied: list[dict] = []
+        self._new_level = new_level
+
+    async def apply(self, peer, deltas):
+        self.applied.append(dict(deltas))
+        return {k: self._new_level for k in deltas}
+
+
+class FakeReflection:
+    """Stand-in for ReflectionStore: records (kind, text) of every fact written."""
+
+    def __init__(self, outcome: str = "inserted"):
+        self.recorded: list[tuple[str, str]] = []
+        self._outcome = outcome
+
+    async def record(self, peer, kind, text, *, source=None):
+        self.recorded.append((kind, text))
+        return self._outcome
+
+
+@pytest.mark.asyncio
+async def test_reward_fires_bumps_novelty_records_fact_and_spawns_followups():
+    existing = [_cur(10, "what bike do they ride?")]
+    store = FakeStore(existing)
+    provider = FakeRewardProvider(
+        detection='{"answered": [0], "curious": []}',
+        reward='{"fact": "They ride a steel road bike", '
+        '"follow_ups": ["How long have they cycled?"]}',
+    )
+    driver = CuriosityDriver(store, provider, _cfg(JEFF_CURIOSITY_REWARD_ENABLED="true"))
+    drive = FakeDrive()
+    refl = FakeReflection()
+    driver.attach_reward_sinks(drive_store=drive, reflection_store=refl)
+
+    await driver._detect("EpeerD", "a steel road bike", "nice")
+
+    assert store.satisfied == [[10]]
+    # (1) novelty drive bumped by a positive delta.
+    assert drive.applied and drive.applied[0].get("novelty", 0) > 0
+    # (2) the answer distilled into a durable FACT.
+    assert refl.recorded == [("fact", "They ride a steel road bike")]
+    # (3) the follow-on question stored as a new curiosity.
+    assert "How long have they cycled?" in store.added
+    # Two LLM calls: detection then the reward distillation.
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_reward_disabled_skips_the_reward_pass():
+    store = FakeStore([_cur(10, "q?")])
+    provider = FakeRewardProvider(
+        '{"answered": [0], "curious": []}',
+        '{"fact": "x", "follow_ups": ["y?"]}',
+    )
+    driver = CuriosityDriver(store, provider, _cfg())  # reward flag off (default)
+    driver.attach_reward_sinks(drive_store=FakeDrive(), reflection_store=FakeReflection())
+
+    await driver._detect("EpeerD", "u", "a")
+
+    assert store.satisfied == [[10]]  # still satisfied — resolution itself unchanged
+    assert len(provider.calls) == 1  # only detection; no reward round-trip
+    assert store.added == []  # no follow-up spawned
+
+
+@pytest.mark.asyncio
+async def test_reward_without_sinks_still_spawns_followups():
+    # Appraisal + reflection off (no sinks attached) → novelty/fact skipped, but
+    # follow-ups always write to the curiosity store and nothing crashes.
+    store = FakeStore([_cur(10, "q?")])
+    provider = FakeRewardProvider(
+        '{"answered": [0], "curious": []}',
+        '{"fact": "a durable fact", "follow_ups": ["new q?"]}',
+    )
+    driver = CuriosityDriver(store, provider, _cfg(JEFF_CURIOSITY_REWARD_ENABLED="true"))
+
+    await driver._detect("EpeerD", "u", "a")
+
+    assert store.added == ["new q?"]
+    assert len(provider.calls) == 2  # reward pass still runs for the follow-ups
+
+
+@pytest.mark.asyncio
+async def test_reward_skipped_when_nothing_satisfied():
+    store = FakeStore([_cur(10, "q?")])
+    provider = FakeRewardProvider(
+        '{"answered": [], "curious": ["new?"]}',
+        '{"fact": "x", "follow_ups": ["z?"]}',
+    )
+    driver = CuriosityDriver(store, provider, _cfg(JEFF_CURIOSITY_REWARD_ENABLED="true"))
+    driver.attach_reward_sinks(drive_store=FakeDrive(), reflection_store=FakeReflection())
+
+    await driver._detect("EpeerD", "u", "a")
+
+    assert store.satisfied == []
+    assert len(provider.calls) == 1  # no resolution → no reward pass
+
+
+@pytest.mark.asyncio
+async def test_reward_novelty_failure_does_not_block_distillation():
+    # The deterministic novelty bump is guarded independently of the distillation:
+    # a drive-store fault must not stop the fact/follow-ups (or taint the pass).
+    class BoomDrive:
+        async def apply(self, peer, deltas):
+            raise RuntimeError("drive db down")
+
+    store = FakeStore([_cur(10, "q?")])
+    provider = FakeRewardProvider(
+        '{"answered": [0], "curious": []}',
+        '{"fact": "", "follow_ups": ["q2?"]}',
+    )
+    driver = CuriosityDriver(store, provider, _cfg(JEFF_CURIOSITY_REWARD_ENABLED="true"))
+    driver.attach_reward_sinks(drive_store=BoomDrive(), reflection_store=FakeReflection())
+
+    await driver._detect("EpeerD", "u", "a")  # must not raise
+
+    assert store.added == ["q2?"]  # distillation ran despite the drive failure
 
 
 @pytest.mark.asyncio

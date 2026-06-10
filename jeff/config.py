@@ -194,6 +194,8 @@ class Config:
     curiosity_every_turns: int
     curiosity_max_open: int
     curiosity_max_new_per_pass: int
+    curiosity_reward_enabled: bool
+    curiosity_reward_novelty_bump: float
 
     reflection_enabled: bool
     reflection_every_turns: int
@@ -335,6 +337,17 @@ class Config:
             curiosity_every_turns=int(e.get("JEFF_CURIOSITY_EVERY_TURNS", "1")),
             curiosity_max_open=int(e.get("JEFF_CURIOSITY_MAX_OPEN", "6")),
             curiosity_max_new_per_pass=int(e.get("JEFF_CURIOSITY_MAX_NEW", "3")),
+            # Resolution reward (ticket 23b1a861) — default OFF: when a curiosity
+            # is answered, feed it back (novelty-drive bump + distilled fact +
+            # follow-on questions). Off → the satisfy() event stays silent state,
+            # byte-identical to today. The novelty bump is per-satisfied-question,
+            # clamped to the appraisal step ceiling so it can't be farmed.
+            curiosity_reward_enabled=_parse_bool(
+                e.get("JEFF_CURIOSITY_REWARD_ENABLED", "false")
+            ),
+            curiosity_reward_novelty_bump=float(
+                e.get("JEFF_CURIOSITY_REWARD_NOVELTY_BUMP", "0.2")
+            ),
             # Reflection / emergent personality (motivation-system slice 2) —
             # default OFF: when off the store/reflector are never built, so
             # behaviour is byte-identical. Defaults mirror the deployed configmap.

@@ -514,6 +514,24 @@ async def run(cfg: Config) -> None:
             if curiosity_driver is not None and proactive_store is not None:
                 curiosity_driver.attach_proactive_store(proactive_store)
 
+            # Close the curiosity reward edge (ticket 23b1a861): when reward is
+            # enabled, a satisfy() event bumps the novelty drive (drive_store),
+            # records a distilled fact (reflection_store), and spawns follow-on
+            # questions. Sinks attached post-hoc (both built later than the
+            # driver); either may be absent — that output is skipped, follow-ups
+            # always write. No-op when curiosity or the reward flag is off.
+            if curiosity_driver is not None and cfg.curiosity_reward_enabled:
+                curiosity_driver.attach_reward_sinks(
+                    drive_store=drive_store, reflection_store=reflection_store
+                )
+                log.info(
+                    "curiosity reward enabled (novelty bump %.2f/answer, "
+                    "drive sink=%s, fact sink=%s)",
+                    cfg.curiosity_reward_novelty_bump,
+                    drive_store is not None,
+                    reflection_store is not None,
+                )
+
             # Impulses (motivation slice) — self-authored short-term directional
             # drives. Default OFF: built only when enabled so the disabled path
             # makes no extra DB calls and stays byte-identical. Plain Postgres (no
