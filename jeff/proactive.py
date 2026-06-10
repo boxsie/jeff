@@ -286,24 +286,35 @@ class ProactiveLoop:
         must never escape into the run loop."""
         try:
             # Cheap deterministic gates first — most ticks bail here, no LLM.
+            # Each bail logs WHY (one line per tick per peer) so the loop's
+            # behaviour is observable — the silence-default would otherwise be a
+            # black box ("is it broken or just quiet?").
             if self._drives is None or self._curiosity is None:
+                log.info("proactive tick peer=%s skip=stores-off", peer)
                 return
             if not self._presence.is_present(
                 peer, now=now, ttl_s=self._cfg.proactive_presence_ttl_s
             ):
+                log.info("proactive tick peer=%s skip=not-present", peer)
                 return
             state = await self._store.get_state(peer)
             if state.muted_until is not None and state.muted_until > now:
+                log.info("proactive tick peer=%s skip=muted", peer)
                 return
             if (
                 state.last_send_at is not None
                 and (now - state.last_send_at).total_seconds()
                 < self._cfg.proactive_min_gap_s
             ):
+                log.info("proactive tick peer=%s skip=min-gap", peer)
                 return
             # Drive pressure: the honest "I miss the conversation" deficit.
             levels = await self._drives.levels(peer)
-            if levels.get("connection", 1.0) >= self._cfg.proactive_connection_threshold:
+            conn = levels.get("connection", 1.0)
+            if conn >= self._cfg.proactive_connection_threshold:
+                log.info(
+                    "proactive tick peer=%s skip=no-pressure conn=%.2f", peer, conn
+                )
                 return
             # Candidates: concrete things worth raising (open curiosities).
             open_cur = await self._curiosity.open_curiosities(
@@ -311,15 +322,26 @@ class ProactiveLoop:
             )
             candidates = [c.text for c in open_cur][:_MAX_CANDIDATES]
             if not candidates:
+                log.info(
+                    "proactive tick peer=%s skip=no-candidates conn=%.2f", peer, conn
+                )
                 return
             # Dedup: don't reach out about the identical unchanged set again.
             nudge_key = _fingerprint(candidates)
             if nudge_key == state.last_nudge_key:
+                log.info("proactive tick peer=%s skip=dedup conn=%.2f", peer, conn)
                 return
             # Only now consult the model — as a silence-default gatekeeper.
+            log.info(
+                "proactive tick peer=%s consulting gatekeeper (conn=%.2f, %d candidate(s))",
+                peer,
+                conn,
+                len(candidates),
+            )
             decision = await self._decide(peer, candidates, levels)
             send, message = _parse_decision(decision)
             if not send or message is None:
+                log.info("proactive tick peer=%s gatekeeper=held", peer)
                 return
             await self._handle.send_message(peer, message)
             await self._memory.remember(peer, "assistant", message)
