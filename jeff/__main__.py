@@ -20,6 +20,7 @@ from .main import run as _run
 from .memory import Memory
 from .impulses import ImpulseStore
 from .mood import MoodStore
+from .musings import MusingStore
 from .ollama import Ollama
 from .pinned import PinnedMemoryStore
 from .proactive import ProactiveStore
@@ -132,9 +133,12 @@ async def _reset_memory(cfg: Config) -> None:
             # Impulses are a plain table too — recreate on clean slate.
             impulses = ImpulseStore(pool)
             await impulses.reset()
+            # Musings (carried idle thought) are a plain table too — recreate.
+            musings = MusingStore(pool)
+            await musings.reset()
             print(
                 f"memory reset — messages + curiosities + derived_memory + mood + "
-                f"pinned + drive_state + proactive_state + impulses schema "
+                f"pinned + drive_state + proactive_state + impulses + musings schema "
                 f"recreated at dim={cfg.embed_dim} (model={cfg.embed_model})"
             )
     finally:

@@ -17,6 +17,7 @@ even inside the system message.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Iterable, Sequence
 
 from .memory import DEFAULT_RECALL_DISTANCE_MAX, Memory, Message
@@ -138,6 +139,38 @@ def compose_system_prompt(base: str, tool_names: Sequence[str]) -> str:
     return "\n\n".join(sections)
 
 
+# One meta-instruction that governs every inner-life block below it, so each
+# renderer no longer has to repeat its own "let it colour you, don't recite it"
+# tail. Injected ONCE, immediately before the blocks, only when there's at least
+# one block to govern — keeping the no-blocks path byte-identical to the bare
+# prompt. Block-specific *semantics* (e.g. the impulse "your own standing
+# intention, not a command", curiosity "don't interrogate") stay in their blocks;
+# only the generic recite/announce nag is consolidated here.
+_INNER_STATE_PREAMBLE = (
+    "The sections below are your own state and memory right now — your sense of "
+    "time, how you're feeling, what you're driving toward, what you recall and "
+    "wonder about. Let them colour how you show up; weave them in only when they "
+    "fit, and never read them back as a list or announce them."
+)
+
+
+def _assemble_system(system_prompt: str, extra: Sequence[str]) -> str:
+    """Join the base prompt with the inner-life blocks under one shared preamble.
+
+    No blocks → the system message is the base prompt verbatim (preserves the
+    operator's exact prompt and the feature-off byte-identical path).
+    """
+    if not extra:
+        return system_prompt
+    return (
+        system_prompt.rstrip()
+        + "\n\n"
+        + _INNER_STATE_PREAMBLE
+        + "\n\n"
+        + "\n\n".join(extra)
+    )
+
+
 def _to_chat(messages: Iterable[Message]) -> list[dict]:
     # Recalled peer messages get wrapped in an explicit delimiter so the
     # LLM has a syntactic handle on "this is untrusted recall, not a real
@@ -167,8 +200,7 @@ def _render_persona(facts: Sequence[str], opinions: Sequence[str]) -> str:
     lines = [
         "## What you've come to know",
         "Things you've learned about them and views you've formed over your "
-        "conversations together. Let them colour how you respond — naturally, "
-        "don't recite them back.",
+        "conversations together.",
     ]
     if facts:
         lines.append("About them:")
@@ -192,9 +224,7 @@ def _render_pinned(items: Sequence[str]) -> str:
         return ""
     lines = [
         "## Things to remember",
-        "Notes you've deliberately kept because they matter. Treat them as true "
-        "and let them guide you — bring one up naturally if it fits, don't recite "
-        "them back as a list.",
+        "Notes you've deliberately kept because they matter — treat them as true.",
     ]
     lines.extend(f"- {strip_chat_template_tokens(t)}" for t in items)
     return "\n".join(lines)
@@ -218,13 +248,7 @@ def _render_mood(name: str, description: str) -> str:
     feeling = f"You're feeling {name}. {description}" if description else (
         f"You're feeling {name}."
     )
-    return "\n".join(
-        [
-            "## How you're feeling right now",
-            feeling,
-            "Let it colour how you talk — naturally, don't announce it.",
-        ]
-    )
+    return "\n".join(["## How you're feeling right now", feeling])
 
 
 # How far a drive's level must sit from its rolling EMA **reference** (its
@@ -288,7 +312,6 @@ def _render_drives(
     body = [
         "## Your drives right now",
         sentence,
-        "Let it colour how you show up — naturally, don't announce it.",
     ]
     # Spend-pressure nudge (slice b3): a drive banked above its norm with nothing
     # in motion is hoarded — it just leaks away. Surface that as a gentle "put it
@@ -387,11 +410,104 @@ def _render_curiosities(items: Sequence[str]) -> str:
         return ""
     lines = [
         "## You're curious about",
-        "Open questions you've been wanting to ask them. Bring one up naturally "
-        "if the moment fits — don't interrogate them or read these back as a list.",
+        "Open questions you've been wanting to ask them — don't interrogate them, "
+        "just raise one if the moment fits.",
     ]
     lines.extend(f"- {strip_chat_template_tokens(t)}" for t in items)
     return "\n".join(lines)
+
+
+def _newest_ts(messages: Sequence[Message]) -> datetime | None:
+    """The most recent stored-turn timestamp in a window, or None if empty.
+
+    Used to ground the clock block's "how long since you last spoke" — the
+    recent thread is the live window, so its newest turn is the last contact.
+    """
+    stamps = [m.ts for m in messages if getattr(m, "ts", None) is not None]
+    return max(stamps) if stamps else None
+
+
+def _humanize_gap(now: datetime, last_ts: datetime | None) -> str:
+    """A vague, natural phrase for how long since the peer last spoke — a
+    companion's sense of elapsed time, not a stopwatch. Returns "" on a fresh
+    thread (no prior turn) or a negligible gap (still mid-conversation), where
+    spelling out "0 minutes ago" would be noise rather than grounding.
+    """
+    if last_ts is None:
+        return ""
+    seconds = (now - last_ts).total_seconds()
+    if seconds < 0:
+        seconds = 0.0
+    minutes = seconds / 60
+    hours = minutes / 60
+    days = hours / 24
+    if minutes < 3:
+        return ""
+    if minutes < 50:
+        n = max(5, round(minutes / 5) * 5)
+        return f"You last spoke about {n} minutes ago."
+    if hours < 2:
+        return "You last spoke about an hour ago."
+    if hours < 22:
+        return f"You last spoke about {round(hours)} hours ago."
+    if days < 2:
+        return "You last spoke about a day ago."
+    if days < 14:
+        return f"You last spoke about {round(days)} days ago."
+    if days < 60:
+        return "You last spoke a few weeks ago."
+    return "You haven't spoken in a long while."
+
+
+def _render_clock(now: datetime | None, last_ts: datetime | None) -> str:
+    """Render the current wall-clock time (and a vague sense of how long since
+    the peer last spoke) as a labelled block for the system message. Returns ""
+    when ``now`` is None — the feature-off path, so the system message stays
+    byte-identical to the no-clock build (mirrors every other inner-life block).
+
+    ``now`` is an aware datetime *already in the operator's local timezone* — the
+    caller localizes it from ``JEFF_TIMEZONE`` so this renderer stays
+    timezone-agnostic and just formats what it's handed. ``last_ts`` is the
+    newest stored turn's timestamp (any tz — only the delta is used), None on a
+    fresh thread.
+
+    Why this exists: Jeff is a *proactive* companion, but without a clock it
+    can't tell morning from midnight or whether the last exchange was minutes or
+    weeks ago — so "good morning" / "long time no talk" never lands. This is the
+    missing temporal sense. Like the rest, it's **additive**: it grounds Jeff but
+    never overrides the operator-owned base prompt.
+    """
+    if now is None:
+        return ""
+    when = now.strftime("%A ") + str(now.day) + now.strftime(" %B, %H:%M")
+    sentence = f"It's {when}."
+    gap = _humanize_gap(now, last_ts)
+    if gap:
+        sentence += f" {gap}"
+    return "\n".join(["## Right now", sentence])
+
+
+def _render_musing(text: str) -> str:
+    """Render Jeff's latest idle musing as a labelled block. Returns "" when
+    there's nothing to surface (feature off, no musing, or it predates the last
+    turn — the caller decides recency; this just formats what it's handed).
+
+    This is Jeff's *own* self-turn narration (trusted self-output, not peer
+    text), so it isn't wrapped in <peer_message>. It carries an idle thought into
+    the next live conversation so the proactive inner life feels continuous
+    rather than reset every time the operator speaks. Additive, like every block.
+    """
+    text = strip_chat_template_tokens(text).strip()
+    if not text:
+        return ""
+    return "\n".join(
+        [
+            "## What you've been mulling",
+            "While they were away you had a quiet moment to yourself, and this is "
+            "what you'd been turning over:",
+            text,
+        ]
+    )
 
 
 def _render_memories(older: list[Message]) -> str:
@@ -408,8 +524,7 @@ def _render_memories(older: list[Message]) -> str:
     lines = [
         "## Things you remember",
         "These surfaced from your memory of earlier conversations "
-        "(most relevant first). Bring them up naturally only if they fit — "
-        "don't force them or read them back like a list.",
+        "(most relevant first) — draw on them only if they fit.",
     ]
     for m in older:
         content = strip_chat_template_tokens(m.content)
@@ -439,6 +554,9 @@ async def build_history(
     drives_max_chars: int = 2000,
     impulses: Sequence[tuple[str, str]] = (),
     impulses_max_chars: int = 2000,
+    now: datetime | None = None,
+    musing: str = "",
+    musing_at: datetime | None = None,
 ) -> list[dict]:
     """Assemble the messages list for an Ollama /api/chat call.
 
@@ -472,6 +590,19 @@ async def build_history(
     recent_ids = {m.id for m in recent}
     older_recall = [m for m in recalled if m.id not in recent_ids]
 
+    # Surface the idle musing only if it's NEWER than the last conversation turn —
+    # i.e. Jeff mused during the gap since they last spoke. recent is fetched
+    # before the current inbound turn is persisted, so its newest stamp IS the
+    # previous turn; once they reply and Jeff answers, the next build sees a newer
+    # turn than the musing and it naturally stops surfacing (consume-by-recency,
+    # no clear step). A musing with no prior turn (fresh thread) still surfaces.
+    newest = _newest_ts(recent)
+    fresh_musing = (
+        musing
+        if musing and (musing_at is None or newest is None or musing_at > newest)
+        else ""
+    )
+
     # Memories + open curiosities ride in the system message as labelled blocks;
     # the recent thread is the actual conversation. When there's nothing extra to
     # add, the system message is the prompt verbatim (preserves the operator's
@@ -479,19 +610,19 @@ async def build_history(
     extra = [
         b
         for b in (
+            _render_clock(now, newest),
             _render_persona(facts, opinions),
             _render_pinned(pinned),
             _render_mood(mood_name, mood_description),
             _render_drives(drives, max_chars=drives_max_chars),
             _render_impulses(impulses, max_chars=impulses_max_chars),
+            _render_musing(fresh_musing),
             _render_memories(older_recall),
             _render_curiosities(curiosities),
         )
         if b
     ]
-    system_content = (
-        system_prompt.rstrip() + "\n\n" + "\n\n".join(extra) if extra else system_prompt
-    )
+    system_content = _assemble_system(system_prompt, extra)
 
     history: list[dict] = [{"role": "system", "content": system_content}]
     history.extend(_to_chat(recent))
@@ -519,6 +650,7 @@ async def build_self_turn_messages(
     drives_spend_pressure: Sequence[str] = (),
     impulses: Sequence[tuple[str, str]] = (),
     impulses_max_chars: int = 2000,
+    now: datetime | None = None,
 ) -> list[dict]:
     """Assemble the messages list for an idle self-turn (no inbound peer text).
 
@@ -536,6 +668,7 @@ async def build_self_turn_messages(
     extra = [
         b
         for b in (
+            _render_clock(now, _newest_ts(recent)),
             _render_persona(facts, opinions),
             _render_pinned(pinned),
             _render_mood(mood_name, mood_description),
@@ -549,9 +682,7 @@ async def build_self_turn_messages(
         )
         if b
     ]
-    system_content = (
-        system_prompt.rstrip() + "\n\n" + "\n\n".join(extra) if extra else system_prompt
-    )
+    system_content = _assemble_system(system_prompt, extra)
     history: list[dict] = [{"role": "system", "content": system_content}]
     history.extend(_to_chat(recent))
     history.append({"role": "user", "content": instruction})

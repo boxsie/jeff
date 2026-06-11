@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING
 
 from .appraisal import DRIVES, DriveReading, classify_pressure
@@ -35,6 +36,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .llm import ChatProvider
     from .memory import Memory
     from .mood import MoodStore
+    from .musings import MusingStore
     from .reflection import ReflectionStore
     from .appraisal import DriveState
     from .tools.base import ToolRegistry
@@ -133,6 +135,7 @@ class SelfTurnLoop:
         mood_store: "MoodStore | None",
         drive_store: "DriveState | None",
         impulse_store: "ImpulseStore | None",
+        musing_store: "MusingStore | None" = None,
         cfg: "Config",
         allowlist,
     ):
@@ -144,6 +147,7 @@ class SelfTurnLoop:
         self._mood = mood_store
         self._drives = drive_store
         self._impulses = impulse_store
+        self._musings = musing_store
         self._cfg = cfg
         self._allowlist = list(allowlist)
         # Pick the framing once: if the outward `reach_out` verb is in the
@@ -237,7 +241,7 @@ class SelfTurnLoop:
                 instruction = instruction + "\n\n" + addendum
 
             messages = await self._build_messages(
-                peer, impulses, open_cur, reading, instruction, banked_nouns
+                peer, impulses, open_cur, reading, instruction, banked_nouns, now
             )
             # The execute-and-loop runs Jeff's chosen inward verbs (or none). The
             # result is Jeff's own narration — not sent anywhere, just logged.
@@ -251,6 +255,18 @@ class SelfTurnLoop:
             )
             # Advance the min-gap whether or not Jeff acted: the turn was spent.
             self._last[peer] = now
+            # Carry the idle thought forward: persist the narration so the next
+            # reactive turn can surface it as "what you've been mulling". Latest
+            # wins (last-write); blank narration is a no-op in the store. Best-
+            # effort — a write fault must never kill the loop, so swallow it (the
+            # min-gap already advanced; we just lose this one musing).
+            if self._musings is not None and result:
+                try:
+                    await self._musings.record(peer, result)
+                except Exception as e:
+                    log.error(
+                        "musing record failed peer=%s exc=%s", peer, type(e).__name__
+                    )
             excerpt = " ".join((result or "").split())[:200]
             log.info(
                 "self-turn done peer=%s impulses=%d curiosities=%d narration=%r",
@@ -281,14 +297,16 @@ class SelfTurnLoop:
         }
 
     async def _build_messages(
-        self, peer, impulses, open_cur, reading, instruction, spend_pressure
+        self, peer, impulses, open_cur, reading, instruction, spend_pressure, now
     ) -> list[dict]:
         """Assemble the self-turn context: base persona + the state blocks (mood,
         drives, impulses, curiosities) + the recent thread + the synthetic nudge.
         ``instruction`` is the (possibly pressure-augmented) self-turn directive
         and ``spend_pressure`` the banked-idle drive nouns to nudge in the drives
-        block. Each block fetch is best-effort — a read fault drops that block,
-        never the turn (mirrors handle_turn's additive-block discipline)."""
+        block. ``now`` is the loop's UTC tick, localized to the operator's
+        timezone for the clock block (or skipped when the clock is off). Each
+        block fetch is best-effort — a read fault drops that block, never the
+        turn (mirrors handle_turn's additive-block discipline)."""
         facts: list[str] = []
         opinions: list[str] = []
         if self._reflection is not None:
@@ -312,6 +330,13 @@ class SelfTurnLoop:
             (d.noun, *(reading.get(d.key) or DriveReading(d.baseline, d.baseline)))
             for d in DRIVES
         ]
+        # Localize the loop's UTC tick for the clock block, or None when off
+        # (None → no "## Right now" block, byte-identical to the no-clock build).
+        local_now = (
+            now.astimezone(ZoneInfo(self._cfg.timezone))
+            if self._cfg.clock_enabled
+            else None
+        )
         return await build_self_turn_messages(
             self._memory,
             peer,
@@ -328,4 +353,5 @@ class SelfTurnLoop:
             drives_spend_pressure=spend_pressure,
             impulses=[(i.name, i.description) for i in impulses],
             impulses_max_chars=self._cfg.impulses_max_chars,
+            now=local_now,
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 
 class ConfigError(Exception):
@@ -84,6 +85,24 @@ def _check_prompt_length(text: str, var: str) -> None:
         raise ConfigError(
             f"{var} too long: {len(text)} chars (max {_SYSTEM_PROMPT_MAX_CHARS})"
         )
+
+
+def _resolve_timezone(raw: str | None) -> str:
+    """Validate an IANA timezone name (e.g. "Europe/London"), defaulting to UTC.
+
+    Operator-controlled and only meaningful when the clock block is on, but we
+    validate at load regardless so a typo fails fast here rather than throwing
+    mid-turn when the clock renderer localizes `now`. Returns the validated name
+    (the caller builds the ZoneInfo per turn — it's cached, so that's cheap).
+    """
+    name = (raw or "UTC").strip() or "UTC"
+    try:
+        ZoneInfo(name)
+    except Exception as e:
+        raise ConfigError(
+            f"JEFF_TIMEZONE is not a valid IANA timezone: {name!r}"
+        ) from e
+    return name
 
 
 def _parse_embed_dim(raw: str) -> int:
@@ -230,6 +249,12 @@ class Config:
     self_turn_enabled: bool
     self_turn_interval_s: float
     self_turn_min_gap_s: float
+
+    clock_enabled: bool
+    timezone: str
+
+    musings_enabled: bool
+    musings_max_chars: int
 
     signal_enabled: bool
     signal_api_url: str
@@ -429,6 +454,23 @@ class Config:
             self_turn_enabled=_parse_bool(e.get("JEFF_SELF_TURN_ENABLED", "false")),
             self_turn_interval_s=float(e.get("JEFF_SELF_TURN_INTERVAL_S", "900")),
             self_turn_min_gap_s=float(e.get("JEFF_SELF_TURN_MIN_GAP_S", "3600")),
+            # Clock / temporal grounding (default off): when off, build_history is
+            # passed now=None and the "## Right now" block never renders, so the
+            # system message is byte-identical. When on, each turn injects the
+            # current local wall-clock time (in JEFF_TIMEZONE) plus a vague sense
+            # of how long since the peer last spoke — the temporal sense a
+            # proactive companion needs for "morning" / "long time no talk".
+            clock_enabled=_parse_bool(e.get("JEFF_CLOCK_ENABLED", "false")),
+            timezone=_resolve_timezone(e.get("JEFF_TIMEZONE", "UTC")),
+            # Idle-thought continuity (default off): when off the store is never
+            # built, nothing records or surfaces, byte-identical. When on, the
+            # idle self-turn's narration is kept (latest-per-peer) and surfaced on
+            # the next reactive turn as a "## What you've been mulling" block —
+            # but only while it's newer than the last conversation turn. Needs
+            # JEFF_SELF_TURN_ENABLED to produce anything to record. max_chars caps
+            # the recorded narration (store has a higher hard byte cap as backstop).
+            musings_enabled=_parse_bool(e.get("JEFF_MUSINGS_ENABLED", "false")),
+            musings_max_chars=int(e.get("JEFF_MUSINGS_MAX_CHARS", "600")),
             # Signal front door (default off): when off the client/loop are never
             # built, so behaviour is byte-identical. signal_number is Jeff's own
             # registered Signal number; signal_allowlist is the operator-number

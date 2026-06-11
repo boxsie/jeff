@@ -80,7 +80,9 @@ def test_render_mood_with_definition():
     out = _render_mood("playful", "I tease and push back more.")
     assert "## How you're feeling right now" in out
     assert "You're feeling playful. I tease and push back more." in out
-    assert "colour how you talk" in out
+    # The generic "let it colour your tone" nag now lives once in the shared
+    # inner-state preamble (build_history), not per-block.
+    assert "colour" not in out
     # Self-authored state — NOT wrapped as untrusted peer data.
     assert "<peer_message>" not in out
 

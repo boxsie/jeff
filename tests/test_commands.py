@@ -198,6 +198,7 @@ def _ctx(
     drives=None,
     proactive=None,
     impulses=None,
+    musings=None,
 ) -> CommandContext:
     return CommandContext(
         handle=FakeHandle(),
@@ -213,6 +214,7 @@ def _ctx(
         drives=drives,
         proactive=proactive,
         impulses=impulses,
+        musings=musings,
     )
 
 
@@ -817,5 +819,58 @@ async def test_forget_yes_also_wipes_impulses():
     store = FakeImpulseStore(active=[_Imp("x", "y")])
     await build_command_registry().dispatch(
         "forget", _ctx(memory=mem, args="yes", impulses=store)
+    )
+    assert store.forgotten == ["EpeerD"]
+
+
+class _Muse:
+    def __init__(self, text, created_at):
+        self.text = text
+        self.created_at = created_at
+
+
+class FakeMusingStore:
+    def __init__(self, latest=None):
+        self._latest = latest
+        self.forgotten: list[str] = []
+
+    async def latest(self, peer):
+        return self._latest
+
+    async def forget(self, peer):
+        self.forgotten.append(peer)
+        return 1
+
+
+def test_mind_declared_when_only_musings_enabled():
+    reg = build_command_registry(musings_enabled=True)
+    assert "mind" in reg.names()
+
+
+@pytest.mark.asyncio
+async def test_mind_shows_musing_section():
+    store = FakeMusingStore(
+        _Muse("wondering if they ever fixed that bike", datetime(2026, 6, 9, 14, 0, tzinfo=timezone.utc))
+    )
+    reg = build_command_registry(musings_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(musings=store))
+    assert "musing:" in reply
+    assert "fixed that bike" in reply
+
+
+@pytest.mark.asyncio
+async def test_mind_musing_section_empty_state():
+    reg = build_command_registry(musings_enabled=True)
+    reply = await reg.dispatch("mind", _ctx(musings=FakeMusingStore(None)))
+    assert "musing:" in reply
+    assert "mull things over" in reply
+
+
+@pytest.mark.asyncio
+async def test_forget_yes_also_wipes_musing():
+    mem = FakeMemory()
+    store = FakeMusingStore(_Muse("a thought", datetime(2026, 6, 9, tzinfo=timezone.utc)))
+    await build_command_registry().dispatch(
+        "forget", _ctx(memory=mem, args="yes", musings=store)
     )
     assert store.forgotten == ["EpeerD"]

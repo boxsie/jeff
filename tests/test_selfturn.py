@@ -149,9 +149,21 @@ def _cfg(**extra):
         chat_model="grok",
         max_tool_iters=4,
         tool_timeout_s=30.0,
+        clock_enabled=False,
+        timezone="UTC",
     )
     base.update(extra)
     return SimpleNamespace(**base)
+
+
+class FakeMusings:
+    """Records what the self-turn carries forward as the idle musing."""
+
+    def __init__(self):
+        self.recorded: list[tuple[str, str]] = []
+
+    async def record(self, peer, text):
+        self.recorded.append((peer, text))
 
 
 def _loop(
@@ -161,6 +173,7 @@ def _loop(
     curiosity=None,
     impulses=None,
     drives=None,
+    musings=None,
     cfg=None,
 ):
     return SelfTurnLoop(
@@ -172,6 +185,7 @@ def _loop(
         mood_store=FakeMood(),
         drive_store=drives,
         impulse_store=impulses,
+        musing_store=musings,
         cfg=cfg or _cfg(),
         allowlist=["EpeerD"],
     )
@@ -293,6 +307,36 @@ async def test_banked_idle_drive_nudges_toward_spending():
     instruction = prov.seen[0][-1]["content"]
     assert "banked novelty" in system_msg  # the drives-block nudge
     assert "Hoarding them does nothing" in instruction  # the directive addendum
+
+
+@pytest.mark.asyncio
+async def test_completed_self_turn_records_narration_as_musing():
+    # A self-turn that runs to completion carries its narration forward via the
+    # musing store, so the next reactive turn can surface "what you've been mulling".
+    prov = FakeProvider()  # default narration "done, nothing to do"
+    musings = FakeMusings()
+    loop = _loop(
+        registry=ToolRegistry([RecordMoodTool()]),
+        provider=prov,
+        impulses=FakeImpulses([("poke", "look into X")]),  # something to chew on
+        musings=musings,
+    )
+    await loop._maybe_self_turn("EpeerD", _NOW)
+    assert prov.completes == 1
+    assert musings.recorded == [("EpeerD", "done, nothing to do")]
+
+
+@pytest.mark.asyncio
+async def test_self_turn_without_musing_store_is_inert():
+    # No musing store wired (feature off) → the turn still runs, just records nothing.
+    prov = FakeProvider()
+    loop = _loop(
+        registry=ToolRegistry([RecordMoodTool()]),
+        provider=prov,
+        impulses=FakeImpulses([("poke", "look into X")]),
+    )
+    await loop._maybe_self_turn("EpeerD", _NOW)
+    assert prov.completes == 1  # no crash without a musing store
 
 
 @pytest.mark.asyncio

@@ -9,8 +9,11 @@ import pytest
 from jeff.memory import Message
 from jeff.prompt import (
     SYSTEM_PROMPT,
+    _humanize_gap,
+    _render_clock,
     _render_impulses,
     build_history,
+    build_self_turn_messages,
     compose_system_prompt,
 )
 
@@ -474,3 +477,229 @@ async def test_build_history_strips_chat_template_from_incoming_user_text():
     # And it's wrapped.
     assert last["content"].startswith("<peer_message>")
     assert last["content"].endswith("</peer_message>")
+
+
+# --- musings (idle-thought continuity) ------------------------------------
+
+_MUSE_NOW = datetime(2026, 6, 9, 14, 34, tzinfo=timezone.utc)
+
+
+def _recent_at(delta):
+    return [
+        Message(
+            id=1, peer="EabcD", role="user", content="earlier", ts=_MUSE_NOW + delta
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_musing_surfaces_when_newer_than_last_turn():
+    # Musing happened AFTER the last turn (during the idle gap) → it surfaces.
+    mem = FakeMemory(recall=[], recent=_recent_at(timedelta(hours=-3)))
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="back",
+        recent_turns=10,
+        recall_k=5,
+        musing="been wondering if they ever fixed that bike",
+        musing_at=_MUSE_NOW - timedelta(minutes=30),
+    )
+    sys_msg = history[0]["content"]
+    assert "## What you've been mulling" in sys_msg
+    assert "fixed that bike" in sys_msg
+
+
+@pytest.mark.asyncio
+async def test_musing_hidden_when_older_than_last_turn():
+    # Last turn is NEWER than the musing → already consumed; don't surface it.
+    mem = FakeMemory(recall=[], recent=_recent_at(timedelta(minutes=-5)))
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="back",
+        recent_turns=10,
+        recall_k=5,
+        musing="stale thought",
+        musing_at=_MUSE_NOW - timedelta(hours=2),
+    )
+    assert "## What you've been mulling" not in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_musing_surfaces_on_fresh_thread():
+    # No prior turn at all → a musing still surfaces (mused before any chat).
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        musing="a first idle thought",
+        musing_at=_MUSE_NOW,
+    )
+    assert "## What you've been mulling" in history[0]["content"]
+
+
+def test_render_musing_empty_when_blank():
+    from jeff.prompt import _render_musing
+
+    assert _render_musing("") == ""
+    assert _render_musing("   ") == ""
+
+
+# --- shared inner-state preamble ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inner_state_preamble_present_once_with_blocks():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+        mood_name="playful",
+        mood_description="teasing",
+    )
+    sys_msg = history[0]["content"]
+    # One governing preamble for all blocks; the per-block recite nag is gone.
+    assert sys_msg.count("never read them back as a list") == 1
+    assert "## How you're feeling right now" in sys_msg
+
+
+@pytest.mark.asyncio
+async def test_no_preamble_when_no_blocks():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+    )
+    # Bare path: prompt verbatim, no preamble.
+    assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
+
+
+# --- clock / temporal grounding -------------------------------------------
+
+_FIXED_NOW = datetime(2026, 6, 9, 14, 34, tzinfo=timezone.utc)  # a Tuesday
+
+
+def test_render_clock_off_when_now_none():
+    # The feature-off path: no now → empty string, so the system message stays
+    # byte-identical to a no-clock build.
+    assert _render_clock(None, _FIXED_NOW) == ""
+
+
+def test_render_clock_formats_local_time_and_gap():
+    last = _FIXED_NOW - timedelta(hours=3)
+    block = _render_clock(_FIXED_NOW, last)
+    assert block.startswith("## Right now")
+    # Day name, no-leading-zero day, month, 24h time.
+    assert "Tuesday 9 June, 14:34" in block
+    assert "about 3 hours ago" in block
+
+
+def test_render_clock_no_gap_on_fresh_thread():
+    block = _render_clock(_FIXED_NOW, None)
+    assert "Tuesday 9 June, 14:34" in block
+    assert "last spoke" not in block  # no prior turn → no gap sentence
+
+
+@pytest.mark.parametrize(
+    "minutes,expected",
+    [
+        (1, ""),  # still mid-conversation
+        (12, "about 10 minutes ago"),  # rounded to nearest 5
+        (75, "about an hour ago"),
+        (180, "about 3 hours ago"),
+        (60 * 26, "about a day ago"),
+        (60 * 24 * 4, "about 4 days ago"),
+        (60 * 24 * 20, "a few weeks ago"),
+        (60 * 24 * 200, "a long while"),
+    ],
+)
+def test_humanize_gap_buckets(minutes, expected):
+    phrase = _humanize_gap(_FIXED_NOW, _FIXED_NOW - timedelta(minutes=minutes))
+    if expected == "":
+        assert phrase == ""
+    else:
+        assert expected in phrase
+
+
+def test_humanize_gap_clamps_future_last_ts():
+    # Clock skew shouldn't produce a negative gap; treat it as "just now" → "".
+    assert _humanize_gap(_FIXED_NOW, _FIXED_NOW + timedelta(minutes=5)) == ""
+
+
+@pytest.mark.asyncio
+async def test_build_history_injects_clock_block_when_now_present():
+    # ts is relative to _FIXED_NOW (not wall-clock) so the gap is deterministic.
+    recent = [
+        Message(
+            id=1,
+            peer="EabcD",
+            role="user",
+            content="hey",
+            ts=_FIXED_NOW - timedelta(minutes=180),
+        )
+    ]
+    mem = FakeMemory(recall=[], recent=recent)
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="you there?",
+        recent_turns=10,
+        recall_k=5,
+        now=_FIXED_NOW,
+    )
+    sys_msg = history[0]["content"]
+    assert sys_msg.startswith(SYSTEM_PROMPT)
+    assert "## Right now" in sys_msg
+    assert "Tuesday 9 June, 14:34" in sys_msg
+    # Gap derives from the newest recent turn (180 min ago).
+    assert "about 3 hours ago" in sys_msg
+
+
+@pytest.mark.asyncio
+async def test_build_history_no_clock_block_by_default():
+    mem = FakeMemory(recall=[], recent=[])
+    history = await build_history(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        user_text="hi",
+        recent_turns=10,
+        recall_k=5,
+    )
+    # Default now=None → byte-identical to the bare prompt.
+    assert history[0] == {"role": "system", "content": SYSTEM_PROMPT}
+
+
+@pytest.mark.asyncio
+async def test_build_self_turn_injects_clock_block():
+    recent = [
+        Message(
+            id=1,
+            peer="EabcD",
+            role="user",
+            content="earlier",
+            ts=_FIXED_NOW - timedelta(hours=26),
+        )
+    ]
+    mem = FakeMemory(recall=[], recent=recent)
+    history = await build_self_turn_messages(
+        mem,  # type: ignore[arg-type]
+        peer="EabcD",
+        instruction="quiet moment",
+        recent_turns=10,
+        now=_FIXED_NOW,
+    )
+    sys_msg = history[0]["content"]
+    assert "## Right now" in sys_msg
+    assert "about a day ago" in sys_msg
+    # The self-turn instruction rides unwrapped as the final message.
+    assert history[-1] == {"role": "user", "content": "quiet moment"}

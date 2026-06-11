@@ -48,6 +48,7 @@ if TYPE_CHECKING:  # avoid import cost / cycles at runtime; these are type-only
     from .impulses import ImpulseStore
     from .memory import Memory, Message
     from .mood import MoodStore
+    from .musings import MusingStore
     from .pinned import PinnedMemoryStore
     from .proactive import ProactiveStore
     from .reflection import ReflectionStore
@@ -96,6 +97,7 @@ class CommandContext:
     drives: "DriveState | None" = None
     proactive: "ProactiveStore | None" = None
     impulses: "ImpulseStore | None" = None
+    musings: "MusingStore | None" = None
 
 
 CommandHandler = Callable[[CommandContext], Awaitable[str]]
@@ -230,6 +232,10 @@ async def _cmd_forget(ctx: CommandContext) -> str:
     # them too so a clean slate carries no leftover steering.
     if ctx.impulses is not None:
         await ctx.impulses.forget(ctx.peer)
+    # The carried-over idle musing is a thought from these conversations — wipe it
+    # so a clean slate doesn't surface a stale "what you've been mulling".
+    if ctx.musings is not None:
+        await ctx.musings.forget(ctx.peer)
     return f"Wiped {deleted} stored message(s) — clean slate."
 
 
@@ -624,11 +630,12 @@ async def _cmd_mind(ctx: CommandContext) -> str:
         and ctx.drives is None
         and ctx.proactive is None
         and ctx.impulses is None
+        and ctx.musings is None
     ):
         return (
             "None of curiosity, reflection, moods, pinned memory, drives, "
-            "impulses, or proactive messaging is switched on right now, so "
-            "there's nothing on my mind to show."
+            "impulses, musings, or proactive messaging is switched on right now, "
+            "so there's nothing on my mind to show."
         )
 
     sections: list[str] = []
@@ -697,6 +704,20 @@ async def _cmd_mind(ctx: CommandContext) -> str:
             lines.append("  • haven't reached out on my own yet")
         sections.append("\n".join(lines))
 
+    if ctx.musings is not None:
+        # The idle thought Jeff carried out of her last quiet moment — the thing
+        # that surfaces on the next reactive turn (while it's fresher than the
+        # last thing said). Inherently produced while you're away; this is how
+        # you peek at it on demand once you're back.
+        m = await ctx.musings.latest(ctx.peer)
+        lines = ["musing:"]
+        if m is not None:
+            when = m.created_at.isoformat(timespec="minutes")
+            lines.append(f"  • (from {when}) {_truncate(m.text)}")
+        else:
+            lines.append("  (nothing yet — I mull things over in my idle moments)")
+        sections.append("\n".join(lines))
+
     if ctx.curiosity is not None:
         open_cur = await ctx.curiosity.open_curiosities(ctx.peer, limit=20)
         satisfied = await ctx.curiosity.recently_satisfied(ctx.peer, limit=5)
@@ -740,12 +761,13 @@ def build_command_registry(
     appraisal_enabled: bool = False,
     proactive_enabled: bool = False,
     impulses_enabled: bool = False,
+    musings_enabled: bool = False,
 ) -> CommandRegistry:
     """Jeff's declared command set (see main.run). `/help`/`/whoami` are the
     daemon's built-ins; the old `/new` is subsumed by the augmented `/clear`.
 
     `/mind` is declared when any of curiosity / reflection / mood / remember /
-    appraisal / proactive / impulses is on; `/mood` only when the mood drive is
+    appraisal / proactive / impulses / musings is on; `/mood` only when the mood drive is
     on; `/impulses` only when impulses are on; `/remember` only when the remember
     drive is on; `/mute`+`/unmute` only when proactive messaging is on — keeping
     the feature-off path's declared command set unchanged."""
@@ -777,6 +799,7 @@ def build_command_registry(
         or appraisal_enabled
         or proactive_enabled
         or impulses_enabled
+        or musings_enabled
     ):
         cmds.append(
             Command("mind", "show what's on my mind right now", _cmd_mind)
