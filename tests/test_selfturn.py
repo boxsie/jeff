@@ -15,7 +15,7 @@ from typing import ClassVar
 
 import pytest
 
-from jeff.appraisal import DriveReading
+from jeff.appraisal import DriveReading, SpendRecord
 from jeff.chat_types import ChatResult, ToolCall
 from jeff.selfturn import (
     _SELF_TURN_INSTRUCTION,
@@ -69,9 +69,11 @@ class FakeProvider:
         self._scripted = list(scripted or [])
         self.raise_on_call = raise_on_call
         self.completes = 0
+        self.seen: list[list[dict]] = []
 
     async def complete(self, messages, *, model, tools=None):
         self.completes += 1
+        self.seen.append(list(messages))
         if self.raise_on_call:
             raise RuntimeError("provider boom")
         if self._scripted:
@@ -101,9 +103,10 @@ class FakeImpulses:
 
 
 class FakeDrives:
-    def __init__(self, levels, references=None):
+    def __init__(self, levels, references=None, recent_spends=None):
         self._levels = levels
         self._refs = references or {}
+        self._recent = recent_spends or []  # list[SpendRecord]
         self.spends: list[tuple] = []
 
     async def state(self, peer):
@@ -114,6 +117,9 @@ class FakeDrives:
             k: DriveReading(v, self._refs.get(k, 0.0))
             for k, v in self._levels.items()
         }
+
+    async def recent_spends(self, peer, limit=20):
+        return list(self._recent[:limit])
 
     async def spend(self, peer, action, costs):
         self.spends.append((peer, action, dict(costs)))
@@ -263,6 +269,71 @@ async def test_runs_even_when_drive_off_reference_only():
     await loop._maybe_self_turn("EpeerD", _NOW)
     assert prov.completes == 1
     assert loop._last["EpeerD"] == _NOW
+
+
+# --- spend-pressure guards (slice b3) ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_banked_idle_drive_nudges_toward_spending():
+    # novelty banked above its norm (0.5 vs 0.2) and not spent recently → the
+    # rich-inert guard: the instruction gets the "use it" note and the drives
+    # block names the banked drive.
+    prov = FakeProvider()  # model does nothing; we inspect what it was shown
+    loop = _loop(
+        registry=ToolRegistry([RecordMoodTool()]),
+        provider=prov,
+        curiosity=FakeCuriosity([]),
+        impulses=FakeImpulses([]),
+        drives=FakeDrives({"novelty": 0.5}, references={"novelty": 0.2}),
+    )
+    await loop._maybe_self_turn("EpeerD", _NOW)
+    assert prov.completes == 1
+    system_msg = prov.seen[0][0]["content"]
+    instruction = prov.seen[0][-1]["content"]
+    assert "banked novelty" in system_msg  # the drives-block nudge
+    assert "Hoarding them does nothing" in instruction  # the directive addendum
+
+
+@pytest.mark.asyncio
+async def test_depleted_drive_nudges_toward_a_cheap_move():
+    # connection depleted below its norm (0.1 vs 0.5) → the bankrupt-inert guard:
+    # a recovery nudge, framed as "a cheap move beats withdrawing", not a freeze.
+    prov = FakeProvider()
+    loop = _loop(
+        registry=ToolRegistry([RecordMoodTool()]),
+        provider=prov,
+        curiosity=FakeCuriosity([]),
+        impulses=FakeImpulses([]),
+        drives=FakeDrives({"connection": 0.1}, references={"connection": 0.5}),
+    )
+    await loop._maybe_self_turn("EpeerD", _NOW)
+    assert prov.completes == 1
+    instruction = prov.seen[0][-1]["content"]
+    assert "running low on a drive or two" in instruction
+    assert "beats withdrawing" in instruction
+
+
+@pytest.mark.asyncio
+async def test_banked_but_recently_spent_is_not_idle():
+    # Same banked novelty, but spent within the window → it's being used, not
+    # hoarded: no spend-pressure, and with nothing else to chew on the turn skips.
+    prov = FakeProvider()
+    loop = _loop(
+        registry=ToolRegistry([RecordMoodTool()]),
+        provider=prov,
+        curiosity=FakeCuriosity([]),
+        impulses=FakeImpulses([]),
+        drives=FakeDrives(
+            {"novelty": 0.5},
+            references={"novelty": 0.2},
+            recent_spends=[
+                SpendRecord("recall_memory", "novelty", 0.05, _NOW, None, None)
+            ],
+        ),
+    )
+    await loop._maybe_self_turn("EpeerD", _NOW)
+    assert prov.completes == 0  # not idle → no pressure → nothing to chew on
 
 
 # --- fault isolation --------------------------------------------------------

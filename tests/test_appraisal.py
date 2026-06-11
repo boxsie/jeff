@@ -22,6 +22,7 @@ from jeff.appraisal import (
     _EMA_HALF_LIFE_SECONDS,
     _build_user_block,
     _parse_appraisal,
+    classify_pressure,
     decay_toward_baseline,
     ema_step,
     floor_at_zero,
@@ -228,6 +229,39 @@ def test_render_drives_bands_relative_to_baseline():
 def test_render_drives_respects_max_chars():
     states = [("connection", 0.9, 0.2)]
     assert len(_render_drives(states, max_chars=20)) == 20
+
+
+def test_render_drives_spend_pressure_nudge():
+    # A banked drive passed as spend_pressure gets the "put it to use" nudge; an
+    # empty spend_pressure (the reactive-chat default) leaves the block unchanged.
+    states = [("novelty", 0.6, 0.2)]
+    assert "banked novelty" not in _render_drives(states)
+    nudged = _render_drives(states, spend_pressure=["novelty"])
+    assert "banked novelty" in nudged
+    assert "bleed away" in nudged
+
+
+# --- pure tests: spend-pressure classifier (slice b3) ----------------------
+
+
+def test_classify_pressure_banked_idle_and_depleted():
+    reading = {
+        "novelty": DriveReading(0.6, 0.2),       # high for you, idle → banked
+        "connection": DriveReading(0.1, 0.5),    # low for you → depleted
+        "competence": DriveReading(0.5, 0.5),    # at norm → neither
+    }
+    p = classify_pressure(reading, set(), margin=0.15)
+    assert p.banked_idle == ("novelty",)
+    assert p.depleted == ("connection",)
+
+
+def test_classify_pressure_recent_spend_clears_banked():
+    reading = {"novelty": DriveReading(0.6, 0.2)}
+    # Spent recently → not hoarded → no banked pressure.
+    assert classify_pressure(reading, {"novelty"}, margin=0.15).banked_idle == ()
+    # A depleted drive stays flagged even if recently spent (the deficit is real).
+    low = {"connection": DriveReading(0.1, 0.5)}
+    assert classify_pressure(low, {"connection"}, margin=0.15).depleted == ("connection",)
 
 
 # --- driver tests (no DB, fake store + fake provider) -----------------------

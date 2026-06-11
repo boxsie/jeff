@@ -24,7 +24,7 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from .appraisal import DRIVES, DriveReading
+from .appraisal import DRIVES, DriveReading, classify_pressure
 from .prompt import DRIVE_BAND_MARGIN, build_self_turn_messages
 from .turnloop import run_tool_loop
 
@@ -41,6 +41,42 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 
 log = logging.getLogger("jeff.selfturn")
+
+
+# A banked drive not spent within this window counts as "idle" (hoarded) for the
+# spend-pressure guard (slice b3) — long enough that an actively-spent drive
+# doesn't trip it, short enough that a genuinely hoarded balance gets a nudge
+# before the leak quietly bleeds it away. 6 hours (matches connection's leak).
+_SPEND_PRESSURE_WINDOW_S = 6 * 3600.0
+
+
+def _pressure_addendum(has_banked: bool, has_depleted: bool) -> str:
+    """A standing self-turn note encoding the two affordability guards (slice b3),
+    appended to the instruction only when there's pressure to act on. Drive-name-
+    free (the drives block already names them) — this is the *principle*: hoarding
+    does nothing, and a depleted Jeff should make a cheap recovering move rather
+    than withdraw. Empty string when neither pressure applies (no nudge)."""
+    if has_banked and has_depleted:
+        return (
+            "Where you're at: you're sitting on banked drives with nothing in motion "
+            "— a good moment to actually use them — while running low on others, "
+            "where one small, cheap move to feed them beats withdrawing. Hoarding "
+            "leaks away and waiting it out fixes nothing; a little, done well, is "
+            "worth more than either."
+        )
+    if has_banked:
+        return (
+            "Where you're at: you're sitting on banked drives with nothing in motion. "
+            "Hoarding them does nothing — they just bleed away. If something "
+            "genuinely calls, this is a good moment to put them to use."
+        )
+    if has_depleted:
+        return (
+            "Where you're at: you're running low on a drive or two. One small, cheap "
+            "move to feed one beats withdrawing and waiting it out — you don't need a "
+            "full tank to make a single good move."
+        )
+    return ""
 
 
 # Jeff's own synthetic nudge — the "user" message of a self-turn. It frames the
@@ -170,20 +206,39 @@ class SelfTurnLoop:
                 else []
             )
             reading = await self._drives.state(peer) if self._drives else {}
+            # Which drives were spent recently — a banked drive being actively
+            # spent isn't "hoarded", so it shouldn't trip the spend-pressure nudge.
+            recently_spent = await self._recently_spent(peer, now)
             # A drive is worth chewing on when it sits off its *personal* reference
             # (the rolling EMA), not off some absolute mark — "low/high for me
-            # lately". Banked-or-depleted relative to your norm is the signal.
-            off_reference = any(
-                d.key in reading
-                and abs(reading[d.key].level - reading[d.key].reference)
-                > DRIVE_BAND_MARGIN
-                for d in DRIVES
+            # lately". A drive banked-and-idle (rich-inert) or depleted (bankrupt-
+            # inert) relative to your norm is the signal; a banked drive you're
+            # already spending is being handled, so it no longer counts on its own.
+            pressure = classify_pressure(
+                reading, recently_spent, margin=DRIVE_BAND_MARGIN
             )
+            off_reference = bool(pressure.banked_idle or pressure.depleted)
             if not (impulses or open_cur or off_reference):
                 log.info("self-turn tick peer=%s skip=nothing-to-chew", peer)
                 return
 
-            messages = await self._build_messages(peer, impulses, open_cur, reading)
+            # The two affordability guards (slice b3) ride the framing: a standing
+            # note appended to the instruction (the directive) and the named banked
+            # drives in the drives block (the colour). Neither is a hard gate.
+            noun_by_key = {d.key: d.noun for d in DRIVES}
+            banked_nouns = [
+                noun_by_key[k] for k in pressure.banked_idle if k in noun_by_key
+            ]
+            instruction = self._instruction
+            addendum = _pressure_addendum(
+                bool(pressure.banked_idle), bool(pressure.depleted)
+            )
+            if addendum:
+                instruction = instruction + "\n\n" + addendum
+
+            messages = await self._build_messages(
+                peer, impulses, open_cur, reading, instruction, banked_nouns
+            )
             # The execute-and-loop runs Jeff's chosen inward verbs (or none). The
             # result is Jeff's own narration — not sent anywhere, just logged.
             result = await run_tool_loop(
@@ -208,11 +263,32 @@ class SelfTurnLoop:
             # Type-only (never the message — may carry model/peer-shaped text).
             log.error("self-turn failed peer=%s exc=%s", peer, type(e).__name__)
 
-    async def _build_messages(self, peer, impulses, open_cur, reading) -> list[dict]:
+    async def _recently_spent(self, peer: str, now: datetime) -> set[str]:
+        """Drive keys spent within the spend-pressure window. Best-effort — a read
+        fault yields an empty set (a banked drive then simply reads as idle, which
+        is the safe default: it gets the nudge rather than being silently skipped)."""
+        if self._drives is None:
+            return set()
+        try:
+            spends = await self._drives.recent_spends(peer, limit=20)
+        except Exception as e:
+            log.error("self-turn spend read failed peer=%s exc=%s", peer, type(e).__name__)
+            return set()
+        return {
+            s.drive
+            for s in spends
+            if (now - s.spent_at).total_seconds() <= _SPEND_PRESSURE_WINDOW_S
+        }
+
+    async def _build_messages(
+        self, peer, impulses, open_cur, reading, instruction, spend_pressure
+    ) -> list[dict]:
         """Assemble the self-turn context: base persona + the state blocks (mood,
         drives, impulses, curiosities) + the recent thread + the synthetic nudge.
-        Each block fetch is best-effort — a read fault drops that block, never the
-        turn (mirrors handle_turn's additive-block discipline)."""
+        ``instruction`` is the (possibly pressure-augmented) self-turn directive
+        and ``spend_pressure`` the banked-idle drive nouns to nudge in the drives
+        block. Each block fetch is best-effort — a read fault drops that block,
+        never the turn (mirrors handle_turn's additive-block discipline)."""
         facts: list[str] = []
         opinions: list[str] = []
         if self._reflection is not None:
@@ -239,7 +315,7 @@ class SelfTurnLoop:
         return await build_self_turn_messages(
             self._memory,
             peer,
-            self._instruction,
+            instruction,
             recent_turns=self._cfg.recent_turns,
             system_prompt=self._cfg.system_prompt,
             curiosities=[c.text for c in open_cur],
@@ -249,6 +325,7 @@ class SelfTurnLoop:
             mood_description=mood_description,
             drives=drives,
             drives_max_chars=self._cfg.drives_max_chars,
+            drives_spend_pressure=spend_pressure,
             impulses=[(i.name, i.description) for i in impulses],
             impulses_max_chars=self._cfg.impulses_max_chars,
         )

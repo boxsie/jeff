@@ -263,6 +263,49 @@ def ema_step(
     return floor_at_zero(w * prev_ema + (1.0 - w) * sample)
 
 
+class DrivePressure(NamedTuple):
+    """The two spend-economy pressures (slice b3), as drive-key tuples.
+
+    ``banked_idle`` — drives sitting high *for you* (level ≥ reference + margin)
+    with no recent spend: hoarded and quietly leaking away for nothing, so a nudge
+    to put them to use (the **rich-inert** guard). ``depleted`` — drives low *for
+    you* (level ≤ reference − margin): a nudge that one small cheap move to feed
+    them beats withdrawing (the **bankrupt-inert** guard — affordability as a
+    *bias*, never a hard gate; ``spend`` already floors at 0, so Jeff is never
+    truly frozen and can always make the recovering move)."""
+
+    banked_idle: tuple[str, ...]
+    depleted: tuple[str, ...]
+
+
+def classify_pressure(
+    reading: dict[str, "DriveReading"],
+    recently_spent: set[str],
+    *,
+    margin: float,
+) -> DrivePressure:
+    """Classify each drive's spend pressure from its ``(level, reference)`` reading.
+
+    A drive banked above its personal reference but NOT spent recently is
+    ``banked_idle`` (hoarded → spend pressure); one depleted below its reference is
+    ``depleted`` (deficit → cheap-recovery bias). A banked drive that *was* spent
+    recently is neither — it's being used, no pressure. Pure and deterministic (no
+    clock, no I/O) so the self-turn gate and the prompt block can both key off the
+    same classification. Unknown keys (a drive dropped from the registry) are
+    ignored."""
+    banked: list[str] = []
+    depleted: list[str] = []
+    for key, r in reading.items():
+        if key not in _BASELINES:
+            continue
+        if r.level >= r.reference + margin:
+            if key not in recently_spent:
+                banked.append(key)
+        elif r.level <= r.reference - margin:
+            depleted.append(key)
+    return DrivePressure(tuple(banked), tuple(depleted))
+
+
 _DDL_TABLE = sql.SQL(
     "CREATE TABLE IF NOT EXISTS drive_state ("
     "id BIGSERIAL PRIMARY KEY, "

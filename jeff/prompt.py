@@ -237,7 +237,10 @@ DRIVE_BAND_MARGIN = 0.15
 
 
 def _render_drives(
-    states: Sequence[tuple[str, float, float]], *, max_chars: int = 2000
+    states: Sequence[tuple[str, float, float]],
+    *,
+    max_chars: int = 2000,
+    spend_pressure: Sequence[str] = (),
 ) -> str:
     """Render Jeff's current drive balance as a labelled block for the system
     message. Returns "" when there's nothing to show.
@@ -282,13 +285,23 @@ def _render_drives(
         if low:
             parts.append(f"running a little low on {_join_nouns(low)}")
         sentence = "Right now you're " + ", but ".join(parts) + "."
-    block = "\n".join(
-        [
-            "## Your drives right now",
-            sentence,
-            "Let it colour how you show up — naturally, don't announce it.",
-        ]
-    )
+    body = [
+        "## Your drives right now",
+        sentence,
+        "Let it colour how you show up — naturally, don't announce it.",
+    ]
+    # Spend-pressure nudge (slice b3): a drive banked above its norm with nothing
+    # in motion is hoarded — it just leaks away. Surface that as a gentle "put it
+    # to use" rather than letting it sit. Only the self-turn path passes this; the
+    # reactive chat prompt leaves it empty (Jeff's already engaging there).
+    pressure = [n for n in spend_pressure if n in {noun for noun, _, _ in states}]
+    if pressure:
+        body.insert(
+            2,
+            f"You've been sitting on banked {_join_nouns(pressure)} with nothing in "
+            "motion — a good moment to put it to use rather than let it bleed away.",
+        )
+    block = "\n".join(body)
     return block[:max_chars]
 
 
@@ -503,6 +516,7 @@ async def build_self_turn_messages(
     pinned: Sequence[str] = (),
     drives: Sequence[tuple[str, float, float]] = (),
     drives_max_chars: int = 2000,
+    drives_spend_pressure: Sequence[str] = (),
     impulses: Sequence[tuple[str, str]] = (),
     impulses_max_chars: int = 2000,
 ) -> list[dict]:
@@ -525,7 +539,11 @@ async def build_self_turn_messages(
             _render_persona(facts, opinions),
             _render_pinned(pinned),
             _render_mood(mood_name, mood_description),
-            _render_drives(drives, max_chars=drives_max_chars),
+            _render_drives(
+                drives,
+                max_chars=drives_max_chars,
+                spend_pressure=drives_spend_pressure,
+            ),
             _render_impulses(impulses, max_chars=impulses_max_chars),
             _render_curiosities(curiosities),
         )
