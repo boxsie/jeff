@@ -1,0 +1,23 @@
+# Ensemble service package manifest (ADR-0009 §2). The service-publish pipeline
+# builds this repo into a self-contained archive — a relocatable uv venv whose
+# own CPython is bundled under ./python — with this file at the archive root.
+# Because the interpreter ships in the archive, no host python is required, so
+# `runtime.requires` is omitted.
+#
+# NOTE: running a registry-installed Jeff supervised still needs the per-service
+# env-overlay (operator secrets: JEFF_DB_URL / XAI_API_KEY / allowlist /
+# system-prompt). Publishing — what this manifest enables — does not.
+name: jeff
+version: 0.22.0
+description: Personal AI assistant — first inhabitant of the Ensemble platform
+entrypoint:
+  # Relative to the install root. The venv python self-locates its bundled
+  # stdlib and jeff's site-packages; `-m jeff` runs jeff.__main__:run.
+  command: [".venv/bin/python", "-m", "jeff"]
+capabilities:
+  transport: chat        # client.register() default — Jeff is a chat service
+  acl: allowlist         # operator-only; matches register(acl=ACL.ALLOWLIST)
+  decides_connections: false
+  handles_files: false
+  # Ceiling must cover every command Jeff may register (some inner-life-gated).
+  commands: [clear, debug, forget, impulses, mind, mood, mute, remember, stats, unmute]
