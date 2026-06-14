@@ -8,7 +8,7 @@
 # env-overlay (operator secrets: JEFF_DB_URL / XAI_API_KEY / allowlist /
 # system-prompt). Publishing — what this manifest enables — does not.
 name: jeff
-version: 0.22.0
+version: 0.23.0
 description: Personal AI assistant — first inhabitant of the Ensemble platform
 entrypoint:
   # Relative to the install root. The venv python self-locates its bundled

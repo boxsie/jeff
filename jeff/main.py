@@ -576,17 +576,26 @@ async def run(cfg: Config) -> None:
             else:
                 log.info("commands disabled")
 
-            client_kwargs: dict = {"socket_path": cfg.socket}
-            if cfg.auth_seed_path:
-                client_kwargs["auth_seed"] = cfg.auth_seed_path
+            # Connect via the daemon-supplied environment. Client.from_env()
+            # picks the mode automatically: ENSEMBLE_SERVICE_TOKEN present →
+            # supervised (token auth over ENSEMBLE_SOCKET, no seed); else the
+            # sidecar path (sign with ENSEMBLE_AUTH_SEED if set). So this stays
+            # byte-compatible with the current sidecar until the supervised
+            # install lands.
+            spawn = ensemble.SpawnContext.from_env()
+            # Supervised: the daemon dictates the registration name via
+            # ENSEMBLE_SERVICE_NAME and rejects a mismatch. Sidecar: fall back to
+            # the configured name (JEFF_NAME, default "jeff"). Either way the
+            # name derives Jeff's stable address from the daemon seed.
+            service_name = spawn.service_name or cfg.name
 
             # Specs declared at registration so the daemon can route/aggregate
             # them (and surface them in its unified /help). None → not declared.
             command_specs = commands.to_ensemble_commands() if commands is not None else None
 
-            async with ensemble.Client(**client_kwargs) as client:
+            async with ensemble.Client.from_env() as client:
                 handle = await client.register(
-                    name=cfg.name,
+                    name=service_name,
                     acl=ensemble.ACL.ALLOWLIST,
                     allowlist=cfg.allowlist,
                     description=cfg.description,
@@ -594,10 +603,11 @@ async def run(cfg: Config) -> None:
                 )
                 async with handle:
                     log.info(
-                        "registered service=%s address=%s onion=%s",
-                        cfg.name,
+                        "registered service=%s address=%s onion=%s mode=%s",
+                        service_name,
                         handle.address,
                         handle.onion,
+                        "supervised" if spawn.supervised else "sidecar",
                     )
 
                     async def _on_turn(peer: str, text: str) -> None:
