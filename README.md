@@ -1,5 +1,10 @@
 # Jeff
 
+> ⚠️ **Hobby project — don't take it seriously.** This is just someone having fun
+> building things in their spare time. It is **not secure**, **not complete**, and
+> **not production-ready**. There are no guarantees, no support, and no warranty —
+> don't trust it with anything that matters. Use at your own risk.
+
 Personal AI assistant that lives on the [Ensemble](https://github.com/boxsie/ensemble) decentralized P2P network. Jeff registers as a service against an Ensemble daemon, replies to chats from allowlisted contacts using a local Ollama LLM, and remembers prior conversation in Postgres + pgvector.
 
 ## Architecture
