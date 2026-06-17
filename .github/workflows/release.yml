@@ -1,0 +1,40 @@
+name: release
+
+# Public image build on GitHub-hosted runners (no homelab CI involved).
+# jeff is a Python service, so the installable artifact is a container image,
+# published to GitHub Container Registry (GHCR) using the built-in GITHUB_TOKEN
+# — no external secrets. Pull with:  docker pull ghcr.io/boxsie/jeff:latest
+#
+# Cut a release:  git tag v0.12.0 && git push github v0.12.0
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image version tag to publish (e.g. v0.12.0)'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build + push image
+        run: |
+          IMG="ghcr.io/${{ github.repository_owner }}/jeff"
+          VERSION="${TAG#v}"
+          docker build -t "$IMG:$VERSION" -t "$IMG:latest" .
+          docker push "$IMG:$VERSION"
+          docker push "$IMG:latest"
